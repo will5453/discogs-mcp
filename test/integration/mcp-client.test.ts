@@ -1,0 +1,367 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import worker from '../../src/index-oauth'
+import type { Env } from '../../src/types/env'
+
+const mockMCP_SESSIONS = {
+	put: vi.fn(),
+	get: vi.fn(),
+	list: vi.fn(),
+	delete: vi.fn(),
+}
+
+const mockEnv: Env = {
+	DISCOGS_CONSUMER_KEY: 'test-key',
+	DISCOGS_CONSUMER_SECRET: 'test-secret',
+	MCP_SESSIONS: mockMCP_SESSIONS as any,
+}
+
+// Mock Discogs API responses
+const mockDiscogsResponses = {
+	collection: {
+		releases: [
+			{
+				id: 123456,
+				instance_id: 123456,
+				date_added: '2023-01-01T00:00:00-08:00',
+				rating: 5,
+				basic_information: {
+					id: 123456,
+					title: 'Abbey Road',
+					year: 1969,
+					resource_url: 'https://api.discogs.com/releases/123456',
+					thumb: '',
+					cover_image: '',
+					artists: [{ name: 'The Beatles', id: 1 }],
+					formats: [{ name: 'Vinyl', qty: '1' }],
+					genres: ['Rock'],
+					styles: ['Pop Rock'],
+					labels: [{ name: 'Apple Records', catno: 'PCS 7088' }],
+				},
+			},
+			{
+				id: 654321,
+				instance_id: 654321,
+				date_added: '2023-01-02T00:00:00-08:00',
+				rating: 4,
+				basic_information: {
+					id: 654321,
+					title: 'Dark Side of the Moon',
+					year: 1973,
+					resource_url: 'https://api.discogs.com/releases/654321',
+					thumb: '',
+					cover_image: '',
+					artists: [{ name: 'Pink Floyd', id: 2 }],
+					formats: [{ name: 'Vinyl', qty: '1' }],
+					genres: ['Rock'],
+					styles: ['Progressive Rock'],
+					labels: [{ name: 'Harvest', catno: 'SHVL 804' }],
+				},
+			},
+		],
+		pagination: {
+			page: 1,
+			pages: 1,
+			per_page: 50,
+			items: 2,
+			urls: {},
+		},
+	},
+	release: {
+		id: 123456,
+		title: 'Abbey Road',
+		artists: [{ name: 'The Beatles' }],
+		year: 1969,
+		formats: [{ name: 'Vinyl', qty: '1' }],
+		genres: ['Rock'],
+		styles: ['Pop Rock'],
+		tracklist: [
+			{ position: 'A1', title: 'Come Together', duration: '4:19' },
+			{ position: 'A2', title: 'Something', duration: '3:03' },
+		],
+	},
+}
+
+/**
+ * Parse SSE (Server-Sent Events) response format
+ */
+function parseSSE(text: string): any | null {
+	if (!text) return null
+
+	const lines = text.split('\n')
+	for (const line of lines) {
+		if (line.startsWith('data:')) {
+			const jsonStr = line.substring(5).trim()
+			try {
+				return JSON.parse(jsonStr)
+			} catch (e) {
+				console.error('Failed to parse SSE data:', line)
+				return null
+			}
+		}
+	}
+	return null
+}
+
+/**
+ * Mock MCP Client - simulates Claude Desktop or other MCP clients
+ */
+class MockMCPClient {
+	public sessionId: string | null = null
+	private requestId = 1
+
+	private getNextId(): number {
+		return this.requestId++
+	}
+
+	private async makeRequest(body: any): Promise<any> {
+		const url = this.sessionId ? `http://localhost:8787/mcp?session_id=${this.sessionId}` : 'http://localhost:8787/mcp'
+		const request = new Request(url, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				Accept: 'application/json, text/event-stream',
+				// A real HTTP client always sends Host; the MCP handler validates it on localhost endpoints.
+				Host: 'localhost:8787',
+			},
+			body: JSON.stringify(body),
+		})
+
+		const response = await worker.fetch(request, mockEnv, {} as any)
+
+		// Handle status codes that don't have a response body
+		if (response.status === 204 || response.status === 202) {
+			// 204: No Content (notifications)
+			// 202: Accepted (streaming started, but we're in test mode so no stream to read)
+			return null
+		}
+
+		const text = await response.text()
+
+		// An unauthenticated request gets the OAuth challenge with no body (RFC 6750 §3).
+		if (response.status === 401 && !text) {
+			return { httpStatus: 401, wwwAuthenticate: response.headers.get('WWW-Authenticate') }
+		}
+
+		console.log('Response status:', response.status, 'Text length:', text.length, 'Text:', text.substring(0, 200))
+
+		// Try SSE format first
+		const sseData = parseSSE(text)
+		if (sseData) {
+			return sseData
+		}
+
+		// Fall back to plain JSON
+		try {
+			return JSON.parse(text)
+		} catch (e) {
+			if (text) {
+				console.error('Failed to parse response:', text.substring(0, 500))
+				throw new Error(`Invalid response format: ${text.substring(0, 100)}`)
+			}
+			// Empty response is also invalid for non-204/202 status
+			throw new Error(`Empty response body (status: ${response.status})`)
+		}
+	}
+
+	async initialize(): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'initialize',
+			params: {
+				protocolVersion: '2024-11-05',
+				capabilities: {
+					roots: { listChanged: true },
+					sampling: {},
+				},
+				clientInfo: {
+					name: 'MockMCPClient',
+					version: '1.0.0',
+				},
+			},
+		})
+	}
+
+	async sendInitialized(): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			method: 'initialized',
+		})
+	}
+
+	async authenticate(): Promise<void> {
+		// In OAuth flow, sessions are stored in KV keyed as `session:<id>`
+		const sessionId = 'test-session-123'
+		const sessionData = JSON.stringify({
+			userId: 'test-user-123',
+			username: 'testuser',
+			accessToken: 'test-access-token',
+			accessTokenSecret: 'test-access-secret',
+			iat: Math.floor(Date.now() / 1000),
+			exp: Math.floor(Date.now() / 1000) + 3600,
+		})
+
+		mockMCP_SESSIONS.get.mockResolvedValue(sessionData)
+		this.sessionId = sessionId
+	}
+
+	async listResources(): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'resources/list',
+		})
+	}
+
+	async readResource(uri: string): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'resources/read',
+			params: { uri },
+		})
+	}
+
+	async listTools(): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'tools/list',
+		})
+	}
+
+	async callTool(name: string, args: any = {}): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'tools/call',
+			params: {
+				name,
+				arguments: args,
+			},
+		})
+	}
+
+	async listPrompts(): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'prompts/list',
+		})
+	}
+
+	async getPrompt(name: string, args: any = {}): Promise<any> {
+		return this.makeRequest({
+			jsonrpc: '2.0',
+			id: this.getNextId(),
+			method: 'prompts/get',
+			params: {
+				name,
+				arguments: args,
+			},
+		})
+	}
+}
+
+describe('MCP Client Integration Tests', () => {
+	let client: MockMCPClient
+
+	beforeEach(() => {
+		vi.clearAllMocks()
+		client = new MockMCPClient()
+
+		// Mock Discogs API calls
+		globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+			if (url.includes('/collection/folders/0/releases')) {
+				return Promise.resolve({
+					ok: true,
+					status: 200,
+					json: () => Promise.resolve(mockDiscogsResponses.collection),
+				})
+			}
+			if (url.includes('/releases/123456')) {
+				return Promise.resolve({
+					ok: true,
+					status: 200,
+					json: () => Promise.resolve(mockDiscogsResponses.release),
+				})
+			}
+			if (url.includes('/oauth/identity')) {
+				return Promise.resolve({
+					ok: true,
+					status: 200,
+					json: () =>
+						Promise.resolve({
+							id: 123,
+							username: 'testuser',
+							resource_url: 'https://api.discogs.com/users/testuser',
+						}),
+				})
+			}
+			return Promise.reject(new Error(`Unmocked URL: ${url}`))
+		})
+	})
+
+	describe('Full MCP Protocol Flow', () => {
+		it('should complete full initialization handshake', async () => {
+			// Session path is required — OAuth provider intercepts requests without a bearer token.
+			// Authenticate first so requests are routed through the KV session path.
+			await client.authenticate()
+
+			const initResult = await client.initialize()
+
+			expect(initResult).toMatchObject({
+				jsonrpc: '2.0',
+				id: 1,
+				result: {
+					protocolVersion: '2024-11-05',
+					capabilities: {
+						resources: { listChanged: true },
+						tools: { listChanged: true },
+						prompts: { listChanged: true },
+					},
+					serverInfo: {
+						name: 'discogs-mcp',
+						version: '1.0.0',
+					},
+				},
+			})
+
+			const initNotification = await client.sendInitialized()
+			expect(initNotification).toBeNull()
+		})
+
+		it('should handle unauthenticated access to protected resources', async () => {
+			// Without a session_id param and without a bearer token, the OAuth provider
+			// answers 401 with a challenge that points the client at the resource metadata.
+			const result = await client.readResource('discogs://collection')
+
+			expect(result.httpStatus).toBe(401)
+			expect(result.wwwAuthenticate).toContain('Bearer')
+			expect(result.wwwAuthenticate).toContain('resource_metadata="http://localhost:8787/.well-known/oauth-protected-resource"')
+		})
+
+		it('should allow authenticated access to all features', async () => {
+			await client.authenticate()
+			await client.initialize()
+
+			// Test resources
+			const resourcesList = await client.listResources()
+			expect(resourcesList.result.resources).toHaveLength(1) // Only concrete resource (collection)
+
+			const collectionResource = await client.readResource('discogs://collection')
+			expect(collectionResource.result.contents).toBeDefined()
+
+			// Test tools
+			const toolsList = await client.listTools()
+			expect(toolsList.result.tools).toHaveLength(24)
+
+			const searchResult = await client.callTool('search_collection', { query: 'Beatles' })
+			expect(searchResult.result).toBeDefined()
+
+			// Test prompts
+			const promptsList = await client.listPrompts()
+			expect(promptsList.result.prompts).toHaveLength(3)
+		})
+	})
+})

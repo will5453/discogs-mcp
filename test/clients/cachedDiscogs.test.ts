@@ -1,0 +1,356 @@
+// test/clients/cachedDiscogs.test.ts
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { CachedDiscogsClient } from '../../src/clients/cachedDiscogs'
+import { DiscogsClient } from '../../src/clients/discogs'
+
+// Minimal KV mock — only methods actually used by SmartCache
+function makeKV(store: Map<string, string> = new Map()): KVNamespace {
+  return {
+    get: vi.fn(async (key: string) => store.get(key) ?? null),
+    put: vi.fn(async (key: string, value: string) => { store.set(key, value) }),
+    delete: vi.fn(async (key: string) => { store.delete(key) }),
+    list: vi.fn(async () => ({ keys: [], list_complete: true, cursor: '' })),
+  } as unknown as KVNamespace
+}
+
+function makePageResponse(page: number, totalPages: number, totalItems: number) {
+  const isLastPage = page === totalPages
+  const itemsInLastPage = totalItems % 100 || 100
+  const releasesCount = isLastPage ? itemsInLastPage : 100
+  const releases = Array.from({ length: releasesCount }, (_, i) => ({ id: page * 100 + i }))
+  return {
+    pagination: { page, pages: totalPages, per_page: 100, items: totalItems, urls: {} },
+    releases,
+  }
+}
+
+describe('CachedDiscogsClient.getCompleteCollection', () => {
+  let client: CachedDiscogsClient
+  let mockSearchCollection: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    const kv = makeKV()
+    // CachedDiscogsClient constructor: (client: DiscogsClient, kv: KVNamespace)
+    // The inner DiscogsClient is irrelevant here — we spy on searchCollection directly.
+    client = new CachedDiscogsClient({} as unknown as DiscogsClient, kv)
+    // Spy on the internal searchCollection so we can control page responses
+    mockSearchCollection = vi.fn()
+    vi.spyOn(client as never, 'searchCollection').mockImplementation(mockSearchCollection)
+  })
+
+  it('returns pagination.items equal to the real Discogs total, not truncated count', async () => {
+    // 40 pages = 4000 items, but maxPages default is 50, so all pages are fetched
+    const totalItems = 4000
+    const totalPages = 40
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) => {
+      return Promise.resolve(makePageResponse(opts.page, totalPages, totalItems))
+    })
+
+    const result = await client.getCompleteCollection('', 'user', 'token', 'secret', 'key', 'consumerSecret')
+
+    expect(result.pagination.items).toBe(4000)
+    expect(result.releases).toHaveLength(4000)
+    expect(mockSearchCollection).toHaveBeenCalledTimes(40)
+  })
+
+  it('reports actual total even when collection exceeds maxPages cap', async () => {
+    // 70 pages = 7000 items, exceeds default maxPages=50
+    const totalItems = 7000
+    const totalPages = 70
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) => {
+      return Promise.resolve(makePageResponse(opts.page, totalPages, totalItems))
+    })
+
+    const result = await client.getCompleteCollection('', 'user', 'token', 'secret', 'key', 'consumerSecret')
+
+    // pagination.items should be the REAL Discogs total (7000), not truncated count (5000)
+    expect(result.pagination.items).toBe(7000)
+    // Only 50 pages fetched due to maxPages cap (5000 items at 100/page)
+    expect(mockSearchCollection).toHaveBeenCalledTimes(50)
+  })
+
+  it('logs a warning when collection is truncated', async () => {
+    const consoleSpy = vi.spyOn(console, 'log')
+    const totalItems = 6000
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) => {
+      return Promise.resolve(makePageResponse(opts.page, 60, totalItems))
+    })
+
+    await client.getCompleteCollection('', 'user', 'token', 'secret', 'key', 'consumerSecret')
+
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('truncated'))
+  })
+
+  it('does NOT log a truncation warning when full collection fits within maxPages', async () => {
+    const consoleSpy = vi.spyOn(console, 'log')
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) => {
+      return Promise.resolve(makePageResponse(opts.page, 10, 1000)) // 1000 items, 10 pages
+    })
+
+    await client.getCompleteCollection('', 'user', 'token', 'secret', 'key', 'consumerSecret')
+
+    const truncationLogs = consoleSpy.mock.calls.filter(args => String(args[0]).includes('truncated'))
+    expect(truncationLogs).toHaveLength(0)
+  })
+})
+
+describe('CachedDiscogsClient.getCompleteCollection — time budget', () => {
+  let client: CachedDiscogsClient
+  let mockSearchCollection: ReturnType<typeof vi.fn>
+  let kv: KVNamespace
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    kv = makeKV()
+    client = new CachedDiscogsClient({} as unknown as DiscogsClient, kv)
+    mockSearchCollection = vi.fn()
+    vi.spyOn(client as never, 'searchCollection').mockImplementation(mockSearchCollection)
+  })
+
+  it('returns partial:true when time budget is exceeded mid-fetch', async () => {
+    // Use fake timers so the test is deterministic regardless of machine speed
+    vi.useFakeTimers()
+
+    mockSearchCollection.mockImplementation(
+      async (_u: string, _a: string, _s: string, opts: { page: number }) => {
+        await vi.advanceTimersByTimeAsync(50)
+        return makePageResponse(opts.page, 5, 500)
+      }
+    )
+
+    // Budget of 75ms: fits page 1 (50ms) but not page 2 (would be 100ms total)
+    const resultPromise = client.getCompleteCollection('', 'user', 'tok', 'sec', 'key', 'csec', 50, 75)
+    await vi.runAllTimersAsync()
+    const result = await resultPromise
+
+    expect(result.partial).toBe(true)
+    expect(result.releases.length).toBeGreaterThan(0)
+    expect(result.releases.length).toBeLessThan(500)
+
+    vi.useRealTimers()
+  })
+
+  it('returns partial:undefined and full data when budget is sufficient', async () => {
+    // 3-page collection, generous budget
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) =>
+      Promise.resolve(makePageResponse(opts.page, 3, 300))
+    )
+
+    const result = await client.getCompleteCollection('', 'user', 'tok', 'sec', 'key', 'csec', 50, 30000)
+
+    expect(result.partial).toBeUndefined() // no partial flag on complete results
+    expect(result.releases).toHaveLength(300)
+  })
+
+  it('does not cache partial results at the complete-collection level', async () => {
+    vi.useFakeTimers()
+
+    // First call: tight budget — returns partial
+    mockSearchCollection.mockImplementation(
+      async (_u: string, _a: string, _s: string, opts: { page: number }) => {
+        await vi.advanceTimersByTimeAsync(50)
+        return makePageResponse(opts.page, 5, 500)
+      }
+    )
+
+    const firstPromise = client.getCompleteCollection('', 'user', 'tok', 'sec', 'key', 'csec', 50, 75)
+    await vi.runAllTimersAsync()
+    await firstPromise
+
+    vi.useRealTimers()
+
+    // Second call: generous budget — should NOT return a cached partial result
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) =>
+      Promise.resolve(makePageResponse(opts.page, 5, 500))
+    )
+
+    const result = await client.getCompleteCollection('', 'user', 'tok', 'sec', 'key', 'csec', 50, 30000)
+
+    expect(result.partial).toBeUndefined()
+    expect(result.releases).toHaveLength(500)
+  })
+
+  it('caches complete result so second call makes zero API calls', async () => {
+    mockSearchCollection.mockImplementation((_u: string, _a: string, _s: string, opts: { page: number }) =>
+      Promise.resolve(makePageResponse(opts.page, 3, 300))
+    )
+
+    await client.getCompleteCollection('', 'user', 'tok', 'sec', 'key', 'csec', 50, 30000)
+    const callsAfterFirst = mockSearchCollection.mock.calls.length
+
+    await client.getCompleteCollection('', 'user', 'tok', 'sec', 'key', 'csec', 50, 30000)
+
+    // Second call should hit KV cache; no additional searchCollection calls
+    expect(mockSearchCollection.mock.calls.length).toBe(callsAfterFirst)
+  })
+})
+
+describe('CachedDiscogsClient.getWantlist — cache keyed by per_page', () => {
+  // The wantlist cache must key on per_page as well as page. Keyed on page alone,
+  // the first per_page to populate a page is served for every later per_page until
+  // the TTL expires — silently truncating a full-wantlist read. Regression test for
+  // https://github.com/rianvdm/discogs-mcp/issues/38.
+  let client: CachedDiscogsClient
+  let innerGetWantlist: ReturnType<typeof vi.fn>
+
+  // Inner client honors per_page the way the real Discogs API does: it returns
+  // min(per_page, total) items and echoes the requested per_page in pagination.
+  function wantlistPage(perPage: number, totalItems: number) {
+    const count = Math.min(perPage, totalItems)
+    return {
+      pagination: { page: 1, pages: Math.max(1, Math.ceil(totalItems / perPage)), per_page: perPage, items: totalItems, urls: {} },
+      wants: Array.from({ length: count }, (_, i) => ({ id: i + 1 })),
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    innerGetWantlist = vi.fn(async (_u: string, _t: string, _s: string, opts: { page?: number; per_page?: number } = {}) =>
+      wantlistPage(opts.per_page ?? 50, 31)
+    )
+    client = new CachedDiscogsClient({ getWantlist: innerGetWantlist } as unknown as DiscogsClient, makeKV())
+  })
+
+  it('does not serve a per_page=1 cache entry to a per_page=100 request for the same page', async () => {
+    // Populate page 1 at per_page=1 — a single, truncated item.
+    const small = await client.getWantlist('user', 'token', 'secret', { page: 1, per_page: 1 }, 'key', 'csecret')
+    expect(small.wants).toHaveLength(1)
+
+    // The same page at per_page=100 must fetch fresh, not reuse the 1-item entry.
+    const full = await client.getWantlist('user', 'token', 'secret', { page: 1, per_page: 100 }, 'key', 'csecret')
+    expect(full.wants).toHaveLength(31)
+    expect(full.pagination.per_page).toBe(100)
+    expect(innerGetWantlist).toHaveBeenCalledTimes(2)
+  })
+
+  it('reuses the cache for an identical (page, per_page) request', async () => {
+    await client.getWantlist('user', 'token', 'secret', { page: 1, per_page: 100 }, 'key', 'csecret')
+    await client.getWantlist('user', 'token', 'secret', { page: 1, per_page: 100 }, 'key', 'csecret')
+    expect(innerGetWantlist).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('CachedDiscogsClient.searchCollection — cache keyed by per_page', () => {
+  // Both collection cache keys must key on per_page as well as page, like the
+  // wantlist key above. Keyed on page alone, a per_page=50 page-1 read written by
+  // one caller is served to a per_page=100 page-1 read by another, which then
+  // paginates with the wrong page count and silently drops items. Regression test
+  // for https://github.com/rianvdm/discogs-mcp/issues/39.
+  let client: CachedDiscogsClient
+  let innerSearchCollection: ReturnType<typeof vi.fn>
+
+  // Inner client honors per_page the way the real Discogs API does: it returns
+  // min(per_page, total) items and echoes the requested per_page in pagination.
+  function collectionPage(perPage: number, totalItems: number) {
+    const count = Math.min(perPage, totalItems)
+    return {
+      pagination: { page: 1, pages: Math.max(1, Math.ceil(totalItems / perPage)), per_page: perPage, items: totalItems, urls: {} },
+      releases: Array.from({ length: count }, (_, i) => ({ id: i + 1 })),
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    innerSearchCollection = vi.fn(async (_u: string, _t: string, _s: string, opts: { page?: number; per_page?: number } = {}) =>
+      collectionPage(opts.per_page ?? 50, 31)
+    )
+    client = new CachedDiscogsClient({ searchCollection: innerSearchCollection } as unknown as DiscogsClient, makeKV())
+  })
+
+  it('browse: does not serve a per_page=1 entry to a per_page=100 request for the same page', async () => {
+    const small = await client.searchCollection('user', 'token', 'secret', { page: 1, per_page: 1 }, 'key', 'csecret')
+    expect(small.releases).toHaveLength(1)
+
+    const full = await client.searchCollection('user', 'token', 'secret', { page: 1, per_page: 100 }, 'key', 'csecret')
+    expect(full.releases).toHaveLength(31)
+    expect(full.pagination.per_page).toBe(100)
+    expect(innerSearchCollection).toHaveBeenCalledTimes(2)
+  })
+
+  it('browse: reuses the cache for an identical (page, per_page) request', async () => {
+    await client.searchCollection('user', 'token', 'secret', { page: 1, per_page: 100 }, 'key', 'csecret')
+    await client.searchCollection('user', 'token', 'secret', { page: 1, per_page: 100 }, 'key', 'csecret')
+    expect(innerSearchCollection).toHaveBeenCalledTimes(1)
+  })
+
+  it('query: does not serve a per_page=1 entry to a per_page=100 request for the same page', async () => {
+    const small = await client.searchCollection('user', 'token', 'secret', { query: 'bowie', page: 1, per_page: 1 }, 'key', 'csecret')
+    expect(small.releases).toHaveLength(1)
+
+    const full = await client.searchCollection('user', 'token', 'secret', { query: 'bowie', page: 1, per_page: 100 }, 'key', 'csecret')
+    expect(full.releases).toHaveLength(31)
+    expect(full.pagination.per_page).toBe(100)
+    expect(innerSearchCollection).toHaveBeenCalledTimes(2)
+  })
+
+  it('query: reuses the cache for an identical (query, page, per_page) request', async () => {
+    await client.searchCollection('user', 'token', 'secret', { query: 'bowie', page: 1, per_page: 100 }, 'key', 'csecret')
+    await client.searchCollection('user', 'token', 'secret', { query: 'bowie', page: 1, per_page: 100 }, 'key', 'csecret')
+    expect(innerSearchCollection).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('CachedDiscogsClient — ExecutionContext plumbing', () => {
+  // The client hands the Worker ExecutionContext to its cache so background KV
+  // deletes outlive the request. https://github.com/rianvdm/discogs-mcp/issues/27
+  it('registers an expired-entry delete with ctx.waitUntil during a cached read', async () => {
+    const expired = JSON.stringify({ data: { releases: [] }, timestamp: 0, expiresAt: Date.now() - 1, version: '1.0.0' })
+    const store = new Map([['cache:collections:user:1:default:desc:50', expired]])
+    const kv = makeKV(store)
+    const ctx = { waitUntil: vi.fn(), passThroughOnException: vi.fn(), props: {} } as unknown as ExecutionContext
+    const inner = { searchCollection: vi.fn(async () => ({ pagination: { page: 1, pages: 1, per_page: 50, items: 0, urls: {} }, releases: [] })) }
+    const client = new CachedDiscogsClient(inner as unknown as DiscogsClient, kv, ctx)
+
+    await client.searchCollection('user', 'token', 'secret', { page: 1 }, 'key', 'csecret')
+
+    expect(ctx.waitUntil).toHaveBeenCalledTimes(1)
+    await (ctx.waitUntil as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(kv.delete).toHaveBeenCalledWith('cache:collections:user:1:default:desc:50')
+  })
+})
+
+describe('CachedDiscogsClient.getMarketplaceStats', () => {
+  let client: CachedDiscogsClient
+  let innerGetStats: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    innerGetStats = vi.fn(async (_id: number, _t: string, _s: string, _k: string, _c: string, currency?: string) => ({
+      num_for_sale: 2,
+      lowest_price: { currency: currency ?? 'EUR', value: 30 },
+      blocked_from_sale: false,
+    }))
+    client = new CachedDiscogsClient({ getMarketplaceStats: innerGetStats } as unknown as DiscogsClient, makeKV())
+  })
+
+  it('serves a repeat request for the same release and currency from cache', async () => {
+    await client.getMarketplaceStats('user', 42, 'token', 'secret', 'key', 'csecret', 'EUR')
+    const second = await client.getMarketplaceStats('user', 42, 'token', 'secret', 'key', 'csecret', 'EUR')
+
+    expect(second.lowest_price).toEqual({ currency: 'EUR', value: 30 })
+    expect(innerGetStats).toHaveBeenCalledTimes(1)
+  })
+
+  it('fetches again for a different currency instead of reusing another currency\'s prices', async () => {
+    await client.getMarketplaceStats('user', 42, 'token', 'secret', 'key', 'csecret', 'EUR')
+    const gbp = await client.getMarketplaceStats('user', 42, 'token', 'secret', 'key', 'csecret', 'GBP')
+
+    expect(gbp.lowest_price).toEqual({ currency: 'GBP', value: 30 })
+    expect(innerGetStats).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps each user\'s default-currency prices separate when no currency is given', async () => {
+    innerGetStats.mockImplementation(async (_id: number, token: string) => ({
+      num_for_sale: 1,
+      lowest_price: { currency: token === 'uk-token' ? 'GBP' : 'EUR', value: 30 },
+      blocked_from_sale: false,
+    }))
+
+    await client.getMarketplaceStats('mathieu', 42, 'fr-token', 'secret', 'key', 'csecret')
+    const uk = await client.getMarketplaceStats('alice', 42, 'uk-token', 'secret', 'key', 'csecret')
+
+    expect(uk.lowest_price?.currency).toBe('GBP')
+    expect(innerGetStats).toHaveBeenCalledTimes(2)
+  })
+})

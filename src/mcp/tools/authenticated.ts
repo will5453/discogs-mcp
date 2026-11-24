@@ -1,0 +1,2682 @@
+/**
+ * Authenticated tools - require Discogs OAuth authentication
+ * These tools can only be called after the user has authenticated via OAuth 1.0a
+ */
+import type { ExecutionContext } from '@cloudflare/workers-types'
+import { McpServer } from '@modelcontextprotocol/server'
+import { z } from 'zod'
+import type { Env } from '../../types/env.js'
+import { ADDITIVE_WRITE, DESTRUCTIVE_WRITE, READ_ONLY } from './annotations.js'
+
+import { DiscogsClient } from '../../clients/discogs.js'
+import { syncCollection, type SyncClient } from '../../sync/collectionSync.js'
+import { describeSyncState } from '../../sync/status.js'
+import { recordSyncOutcome } from '../../sync/lastOutcome.js'
+import type { SyncResult } from '../../sync/types.js'
+import { CachedDiscogsClient } from '../../clients/cachedDiscogs.js'
+import { analyzeMoodQuery, hasMoodContent, generateMoodSearchTerms } from '../../utils/moodMapping.js'
+import { formatSearchDiscogsResults } from '../../utils/searchDiscogsFormatter.js'
+import { parseSearchQuery, clearTemporalIfTokenIsLiteral } from '../../utils/searchQueryParser.js'
+import { applySearchPipeline, type DedupedCollectionItem } from '../../utils/searchRanking.js'
+import { buildIndex, searchIndex } from '../../utils/searchIndex.js'
+import type { DiscogsCollectionItem, DiscogsMarketplaceStats, DiscogsWant, DiscogsWantlistResponse } from '../../clients/discogs.js'
+import type { SessionContext } from '../server.js'
+import { sessionProfile } from '../session-profile.js'
+import { buildNextSteps } from '../../utils/breadcrumb.js'
+
+/**
+ * Type for release with relevance score
+ */
+type ReleaseWithRelevance = DiscogsCollectionItem & { relevanceScore?: number }
+
+/**
+ * Extract meaningful filter terms from a semantic query by removing stop words
+ * and short filler words. Used to attempt a best-effort filter before falling
+ * back to the full LLM collection dump.
+ */
+export function extractSemanticFilterTerms(query: string): string[] {
+	const STOP_WORDS = new Set([
+		'a', 'an', 'the', 'and', 'or', 'of', 'for', 'with', 'in', 'on', 'at',
+		'to', 'is', 'it', 'its', 'be', 'by', 'as', 'up', 'do', 'go', 'my',
+		'me', 'we', 'he', 'she', 'so', 'no', 'if', 'but', 'not', 'are', 'was',
+		'that', 'this', 'they', 'them', 'from', 'have', 'had', 'has', 'some',
+		'something', 'anything', 'everything', 'like', 'just', 'more', 'very',
+		'want', 'need', 'give', 'show', 'find', 'get',
+	])
+
+	return query
+		.toLowerCase()
+		.split(/\s+/)
+		.filter((word) => word.length > 2 && !STOP_WORDS.has(word))
+}
+
+/**
+ * Returns true if the query is explicitly asking for a broad/full collection search.
+ * These queries bypass the best-effort semantic filter and go straight to the LLM dump.
+ *
+ * Uses strict matching: the query must be essentially just a broad-search phrase,
+ * optionally surrounded by filler words (please, can you, etc.) and punctuation.
+ * "show all" matches, but "show all Miles Davis" does NOT — that's a real query.
+ */
+export function shouldUseBroadSearch(query: string): boolean {
+	const FILLER_WORDS = new Set(['please', 'can', 'you', 'could', 'would', 'just', 'ok', 'okay', 'yes', 'yeah', 'sure'])
+	const meaningful = query
+		.toLowerCase()
+		.replace(/[^a-z\s]/g, '') // strip punctuation
+		.split(/\s+/)
+		.filter((w) => w.length > 0 && !FILLER_WORDS.has(w))
+		.join(' ')
+		.trim()
+
+	const broadSearchPhrases = new Set([
+		'search more broadly',
+		'show more',
+		'full collection',
+		'broader search',
+		'show everything',
+		'show all',
+	])
+	return broadSearchPhrases.has(meaningful)
+}
+
+/**
+ * Filter an array of releases in-memory using the same logic as
+ * DiscogsClient.searchCollectionWithQuery(), but without any API calls.
+ *
+ * This enables the "fetch once, filter many" optimization: the complete
+ * collection is fetched and cached once, then all query variants (original
+ * + mood expansions) are run as pure in-memory filters against that dataset.
+ */
+export function filterReleasesInMemory(
+	allReleases: DiscogsCollectionItem[],
+	query: string,
+	_options: {
+		hasRecent?: boolean
+		hasOld?: boolean
+		sort?: 'added' | 'artist' | 'title' | 'year'
+		sortOrder?: 'asc' | 'desc'
+	} = {},
+): DiscogsCollectionItem[] {
+	// Extract temporal terms that should affect sorting rather than filtering
+	const temporalTerms = ['recent', 'recently', 'new', 'newest', 'latest', 'old', 'oldest', 'earliest']
+	const queryWords = query.toLowerCase().split(/\s+/)
+
+	// Remove temporal terms from the actual search query
+	const filteredQuery = queryWords.filter((word) => !temporalTerms.includes(word)).join(' ')
+
+	if (!filteredQuery.trim()) {
+		// No actual search terms after removing temporal terms -- return all releases
+		return [...allReleases]
+	}
+
+	// Apply the same filtering logic as searchCollectionWithQuery
+	const filteredReleases = allReleases.filter((item) => {
+		const release = item.basic_information
+
+		// For single word queries or exact ID searches, use simple includes
+		if (!filteredQuery.includes(' ') || /^\d+$/.test(filteredQuery)) {
+			const releaseIdMatch = item.id.toString().includes(filteredQuery) || release.id.toString().includes(filteredQuery)
+			const artistMatch = release.artists?.some((artist) => artist.name.toLowerCase().includes(filteredQuery)) || false
+			const titleMatch = release.title?.toLowerCase().includes(filteredQuery) || false
+			const genreMatch = release.genres?.some((genre) => genre.toLowerCase().includes(filteredQuery)) || false
+			const styleMatch = release.styles?.some((style) => style.toLowerCase().includes(filteredQuery)) || false
+			const labelMatch =
+				release.labels?.some(
+					(label) => label.name.toLowerCase().includes(filteredQuery) || label.catno.toLowerCase().includes(filteredQuery),
+				) || false
+			const formatMatch = release.formats?.some((format) => format.name.toLowerCase().includes(filteredQuery)) || false
+
+			let yearMatch = false
+			if (release.year) {
+				const yearStr = release.year.toString()
+				if (yearStr.includes(filteredQuery)) yearMatch = true
+				const decadeMatch = filteredQuery.match(/(\d{4})s$/)
+				if (decadeMatch) {
+					const startDecade = parseInt(decadeMatch[1])
+					if (release.year >= startDecade && release.year < startDecade + 10) yearMatch = true
+				}
+			}
+
+			return releaseIdMatch || artistMatch || titleMatch || genreMatch || styleMatch || labelMatch || formatMatch || yearMatch
+		}
+
+		// Multi-word queries: smart matching logic
+		const queryTerms = filteredQuery.split(/\s+/).filter((term) => term.length > 2)
+
+		const decadeTerms: string[] = []
+		const nonDecadeTerms: string[] = []
+		queryTerms.forEach((term) => {
+			if (term.match(/^(\d{4})s$/)) {
+				decadeTerms.push(term)
+			} else {
+				nonDecadeTerms.push(term)
+			}
+		})
+
+		const searchableFields = [
+			...(release.artists?.map((artist) => artist.name) || []),
+			release.title,
+			...(release.genres || []),
+			...(release.styles || []),
+			...(release.labels?.map((label) => label.name) || []),
+			...(release.labels?.map((label) => label.catno) || []),
+			...(release.formats?.map((format) => format.name) || []),
+			release.year?.toString() || '',
+			item.id.toString(),
+			release.id.toString(),
+		]
+		if (release.year) {
+			searchableFields.push(`${Math.floor(release.year / 10) * 10}s`)
+		}
+		const searchableText = searchableFields.join(' ').toLowerCase()
+
+		// Determine matching strategy based on query type
+		const genreStyleTerms = [
+			'ambient',
+			'drone',
+			'progressive',
+			'rock',
+			'jazz',
+			'blues',
+			'electronic',
+			'techno',
+			'house',
+			'metal',
+			'punk',
+			'folk',
+			'country',
+			'classical',
+			'hip',
+			'hop',
+			'rap',
+			'soul',
+			'funk',
+			'disco',
+			'reggae',
+			'ska',
+			'indie',
+			'alternative',
+			'psychedelic',
+			'experimental',
+			'avant-garde',
+			'minimal',
+			'downtempo',
+			'chillout',
+			'trance',
+			'dubstep',
+			'garage',
+			'post-rock',
+			'post-punk',
+			'new wave',
+			'synthpop',
+			'industrial',
+			'gothic',
+			'darkwave',
+			'shoegaze',
+			'grunge',
+			'hardcore',
+		]
+
+		const isMoodQuery = hasMoodContent(filteredQuery)
+		const isGenreStyleQuery = nonDecadeTerms.some(
+			(term) =>
+				genreStyleTerms.includes(term.toLowerCase()) ||
+				release.genres?.some((g) => g.toLowerCase() === term.toLowerCase()) ||
+				release.styles?.some((s) => s.toLowerCase() === term.toLowerCase()),
+		)
+
+		let nonDecadeMatch = false
+		if (nonDecadeTerms.length === 0) {
+			nonDecadeMatch = true
+		} else if (isGenreStyleQuery || isMoodQuery) {
+			if (isMoodQuery) {
+				const moodAnalysis = analyzeMoodQuery(filteredQuery)
+				if (moodAnalysis.confidence >= 0.3) {
+					const releaseGenres = release.genres?.map((g) => g.toLowerCase()) || []
+					const releaseStyles = release.styles?.map((s) => s.toLowerCase()) || []
+					const suggestedGenres = moodAnalysis.suggestedGenres.map((g) => g.toLowerCase())
+					const suggestedStyles = moodAnalysis.suggestedStyles.map((s) => s.toLowerCase())
+
+					const moodMatch =
+						releaseGenres.some((rg) => suggestedGenres.some((sg) => rg.includes(sg) || sg.includes(rg))) ||
+						releaseStyles.some((rs) => suggestedStyles.some((ss) => rs.includes(ss) || ss.includes(rs)))
+					const termMatch = nonDecadeTerms.some((term) => searchableText.includes(term))
+					nonDecadeMatch = moodMatch || termMatch
+				} else {
+					nonDecadeMatch = nonDecadeTerms.some((term) => searchableText.includes(term))
+				}
+			} else {
+				nonDecadeMatch = nonDecadeTerms.some((term) => searchableText.includes(term))
+			}
+		} else {
+			nonDecadeMatch = nonDecadeTerms.every((term) => searchableText.includes(term))
+		}
+
+		const decadeMatch =
+			decadeTerms.length === 0 ||
+			decadeTerms.some((term) => {
+				if (searchableText.includes(term)) return true
+				const decadeYear = parseInt(term.replace('s', ''))
+				return release.year && release.year >= decadeYear && release.year < decadeYear + 10
+			})
+
+		return nonDecadeMatch && decadeMatch
+	})
+
+	return filteredReleases
+}
+
+/**
+ * Get authentication instructions for unauthenticated requests
+ */
+function generateAuthInstructions(connectionId: string | undefined, baseUrl: string): string {
+	const loginUrl = connectionId ? `${baseUrl}/login?connection_id=${connectionId}` : `${baseUrl}/login`
+
+	return `🔐 **Authentication Required**
+
+You need to authenticate with Discogs to use this tool.
+
+**How to authenticate:**
+1. Visit: ${loginUrl}
+2. Sign in with your Discogs account
+3. Authorize access to your collection
+4. Return here and try again
+
+Your authentication will be secure and tied to your specific session.`
+}
+
+/** Most wantlist pages a filtered get_wantlist reads (100 wants per page). */
+const WANTLIST_FILTER_MAX_PAGES = 50
+const WANTLIST_FILTER_PAGE_SIZE = 100
+
+/** One get_wantlist line; rating and notes appear only when the user has set them. */
+function formatWantLine(want: DiscogsWant): string {
+	const info = want.basic_information
+	const artists = info?.artists?.map((a) => a.name).join(', ') || 'Unknown'
+	let line = `- ${artists} — ${info?.title ?? 'Unknown'} (${info?.year || 'n/a'}) [release ${want.id}]`
+	if (want.rating > 0) line += ` — rating ${want.rating}/5`
+	const notes = want.notes?.replace(/\s+/g, ' ').trim()
+	if (notes) line += ` — notes: "${notes}"`
+	return line
+}
+
+interface WantlistFilter {
+	notesContains?: string
+	minRating?: number
+}
+
+/**
+ * Read the wantlist page by page and keep the wants that pass every filter.
+ * Discogs can't filter wants itself, so this stops at WANTLIST_FILTER_MAX_PAGES
+ * and reports how many wants it actually looked at.
+ */
+async function collectFilteredWants(
+	fetchPage: (page: number, perPage: number) => Promise<DiscogsWantlistResponse>,
+	filter: WantlistFilter,
+): Promise<{ matches: DiscogsWant[]; scanned: number; total: number }> {
+	const needle = filter.notesContains?.toLowerCase()
+	const passes = (want: DiscogsWant) =>
+		(needle === undefined || (want.notes ?? '').toLowerCase().includes(needle)) &&
+		(filter.minRating === undefined || want.rating >= filter.minRating)
+
+	const matches: DiscogsWant[] = []
+	let scanned = 0
+	let total = 0
+	for (let page = 1; page <= WANTLIST_FILTER_MAX_PAGES; page++) {
+		const result = await fetchPage(page, WANTLIST_FILTER_PAGE_SIZE)
+		total = result.pagination.items
+		scanned += result.wants.length
+		matches.push(...result.wants.filter(passes))
+		if (page >= result.pagination.pages) break
+	}
+	return { matches, scanned, total }
+}
+
+/** Header for a filtered get_wantlist, naming the filters and any part of the wantlist left unsearched. */
+function describeFilteredWantlist(filter: WantlistFilter, matched: number, scanned: number, total: number): string {
+	const criteria: string[] = []
+	if (filter.notesContains !== undefined) criteria.push(`notes containing "${filter.notesContains}"`)
+	if (filter.minRating !== undefined) criteria.push(`rating ${filter.minRating}/5 or higher`)
+	let header = `Wantlist — ${matched} of ${total} item(s) match ${criteria.join(' and ')}`
+	if (scanned < total) {
+		header += ` (searched the first ${scanned} of ${total}; the rest is past the ${WANTLIST_FILTER_MAX_PAGES}-page limit)`
+	}
+	return header
+}
+
+/** Currencies the Discogs marketplace prices in (the `curr_abbr` values its API accepts). */
+const DISCOGS_CURRENCIES = ['USD', 'GBP', 'EUR', 'CAD', 'AUD', 'JPY', 'CHF', 'MXN', 'BRL', 'NZD', 'SEK', 'ZAR'] as const
+
+/** One line of get_marketplace_stats output, worded so a daily check can compare runs line by line. */
+function formatMarketplaceStatsLine(releaseId: number, stats: DiscogsMarketplaceStats): string {
+	if (stats.blocked_from_sale) return `- release ${releaseId}: blocked from sale on Discogs`
+	if (!stats.num_for_sale) return `- release ${releaseId}: none for sale`
+	const price = stats.lowest_price ? `, lowest ${stats.lowest_price.value.toFixed(2)} ${stats.lowest_price.currency}` : ''
+	return `- release ${releaseId}: ${stats.num_for_sale} for sale${price}`
+}
+
+/**
+ * Register all authenticated tools that require Discogs OAuth
+ */
+export function registerAuthenticatedTools(
+	server: McpServer,
+	env: Env,
+	getSessionContext: () => Promise<SessionContext>,
+	ctx?: ExecutionContext,
+): void {
+	// Create Discogs clients
+	const discogsClient = new DiscogsClient()
+	// Set up rate limiter DO for coordinated rate limiting
+	if (env.RATE_LIMITER) {
+		const id = env.RATE_LIMITER.idFromName('discogs-rate-limiter')
+		const stub = env.RATE_LIMITER.get(id)
+		discogsClient.setRateLimiter(stub)
+	}
+	const cachedClient = env.MCP_SESSIONS ? new CachedDiscogsClient(discogsClient, env.MCP_SESSIONS, ctx) : null
+	const client = cachedClient || discogsClient
+
+	/**
+	 * Tool: search_collection
+	 * Search user's Discogs collection with mood-aware queries
+	 */
+	/**
+	 * Detect whether a query is semantic/conceptual (needs LLM interpretation)
+	 * vs a literal/specific search (artist name, album title, genre, year).
+	 *
+	 * Semantic queries describe qualities, feelings, or concepts that don't map
+	 * directly to metadata fields — e.g., "empowering female voice", "road trip
+	 * through the desert", "albums my dad would love".
+	 */
+	function isSemanticQuery(query: string, allReleases: DiscogsCollectionItem[]): boolean {
+		const q = query.toLowerCase().trim()
+
+		// Single word or numeric — always literal
+		if (!q.includes(' ') || /^\d+$/.test(q)) {
+			return false
+		}
+
+		// If the query matches an artist name in the collection, it's literal
+		const matchesArtist = allReleases.some((item) =>
+			item.basic_information.artists?.some((a) => {
+				const name = a.name.toLowerCase()
+				return name.includes(q) || q.includes(name)
+			}),
+		)
+		if (matchesArtist) return false
+
+		// If the query matches an album title in the collection, it's literal
+		const matchesTitle = allReleases.some((item) => {
+			const title = item.basic_information.title?.toLowerCase() || ''
+			return title.includes(q) || q.includes(title)
+		})
+		if (matchesTitle) return false
+
+		// Known music-specific terms that indicate a concrete/literal search
+		const concreteTerms = new Set([
+			'rock',
+			'jazz',
+			'blues',
+			'electronic',
+			'techno',
+			'house',
+			'metal',
+			'punk',
+			'folk',
+			'country',
+			'classical',
+			'hip-hop',
+			'rap',
+			'soul',
+			'funk',
+			'disco',
+			'reggae',
+			'ska',
+			'indie',
+			'alternative',
+			'psychedelic',
+			'experimental',
+			'ambient',
+			'downtempo',
+			'trance',
+			'dubstep',
+			'garage',
+			'post-rock',
+			'post-punk',
+			'new wave',
+			'synthpop',
+			'industrial',
+			'gothic',
+			'shoegaze',
+			'grunge',
+			'hardcore',
+			'r&b',
+			'pop',
+			'latin',
+			'world',
+			'soundtrack',
+			'vinyl',
+			'cd',
+			'cassette',
+			'7"',
+			'12"',
+			'lp',
+		])
+
+		// If ALL non-trivial words are concrete music/format terms, it's literal
+		const words = q.split(/\s+/).filter((w) => w.length > 2)
+		const allConcrete =
+			words.length > 0 &&
+			words.every((w) => {
+				// Check concrete terms, decade patterns, temporal terms
+				return (
+					concreteTerms.has(w) ||
+					/^\d{4}s?$/.test(w) ||
+					['recent', 'recently', 'new', 'newest', 'latest', 'old', 'oldest', 'earliest'].includes(w)
+				)
+			})
+		if (allConcrete) return false
+
+		// If mood mapping has high confidence, the existing pipeline handles it
+		if (hasMoodContent(q)) {
+			const moodAnalysis = analyzeMoodQuery(q)
+			if (moodAnalysis.confidence >= 0.6) {
+				return false
+			}
+		}
+
+		// Otherwise, it's likely a semantic/conceptual query
+		return true
+	}
+
+	/**
+	 * Format a representative sample of the collection compactly so the calling
+	 * LLM can apply its world knowledge to select semantically matching releases.
+	 *
+	 * Capped at `maxReleases` (default 750) to avoid blowing up the LLM context.
+	 * When capping, prioritizes rated items (rating desc) then unrated by date_added desc,
+	 * so the LLM sees the user's most valued music first.
+	 */
+	function formatCollectionForSemanticSearch(
+		allReleases: DiscogsCollectionItem[],
+		query: string,
+		maxReleases: number = 750,
+	): { content: Array<{ type: 'text'; text: string }> } {
+		// Prioritize: rated items first (by rating desc), then unrated by date_added desc
+		const sorted = [...allReleases].sort((a, b) => {
+			if (a.rating > 0 && b.rating > 0) return b.rating - a.rating
+			if (a.rating > 0) return -1
+			if (b.rating > 0) return 1
+			return new Date(b.date_added).getTime() - new Date(a.date_added).getTime()
+		})
+
+		const capped = sorted.slice(0, maxReleases)
+		const wasCapped = allReleases.length > maxReleases
+
+		const compactList = capped
+			.map((release) => {
+				const info = release.basic_information
+				const artists = info.artists.map((a) => a.name).join(', ')
+				const genres = info.genres?.join(', ') || ''
+				const styles = info.styles?.length ? ` | ${info.styles.join(', ')}` : ''
+				const rating = release.rating > 0 ? ` ★${release.rating}` : ''
+				return `[ID:${release.id}|Inst:${release.instance_id}] ${artists} - ${info.title} (${info.year}) | ${genres}${styles}${rating}`
+			})
+			.join('\n')
+
+		const cappedNote = wasCapped
+			? `\n\n⚠️ Showing ${capped.length} of ${allReleases.length} releases (prioritized by rating and recency).`
+			: ''
+
+		const nextSteps = buildNextSteps([
+			{ tool: 'get_release', args: 'release_id=<ID>', hint: 'expand a selected release using its [ID:...] from the list' },
+			{ tool: 'rate_release', args: 'instance_id=<INSTANCE>, folder_id=<FOLDER>, rating=1..5', hint: 'rate a selection (use the [Inst:...] from the list and the folder it lives in)' },
+			{ tool: 'search_discogs', args: `query="${query}", type="master"`, hint: 'broaden to the catalog if collection picks fall short' },
+		])
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text:
+						`**Semantic search mode:** No keyword matches found for "${query}". ` +
+						`Below is the collection (${capped.length} releases).\n\n` +
+						`**Instructions:** Select 8–12 releases that best match the user's intent: "${query}". ` +
+						`Use your knowledge of these artists, albums, and genres to identify the strongest matches. ` +
+						`For each result, include a brief note (1 sentence) explaining why it fits. ` +
+						`If you find fewer than 8 strong matches, return only the ones you're confident about — do not pad with weak matches.\n\n` +
+						`${compactList}${cappedNote}${nextSteps}`,
+				},
+			],
+		}
+	}
+
+	/**
+	 * Build a structured warning when search_collection slices its result set.
+	 * Parallel in shape to the existing collection-truncation warning so the
+	 * calling LLM treats both as the same class of signal.
+	 *
+	 * Fires only when more results exist past the current page. On the last
+	 * page (or when found <= per_page), returns an empty string.
+	 */
+	function buildResultTruncationNote(
+		query: string,
+		found: number,
+		page: number,
+		perPage: number,
+	): string {
+		const totalPages = Math.max(1, Math.ceil(found / perPage))
+		if (page >= totalPages) return ''
+		const shown = Math.max(0, Math.min(perPage, found - (page - 1) * perPage))
+		const nextPage = page + 1
+		return (
+			`\n\n⚠️ Showing ${shown} of ${found} matches for "${query}" (page ${page} of ${totalPages}). ` +
+			`Pass page: ${nextPage} to see more, or narrow your query (add an artist, genre, or year) to filter.`
+		)
+	}
+
+	function buildOutOfRangeNote(query: string, found: number, page: number, perPage: number): string {
+		const totalPages = Math.max(1, Math.ceil(found / perPage))
+		return (
+			`No results on page ${page} for "${query}". ${found} matches exist across pages 1–${totalPages}. ` +
+			`Try page ${totalPages} or lower.`
+		)
+	}
+
+	server.registerTool(
+		'refresh_collection',
+		{
+			description: 'Force an immediate full refresh of the cached collection snapshot. Use after adding or removing items in Discogs if you need them visible to search before the next scheduled sync (every 6 hours).',
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+			if (!session) {
+				return { content: [{ type: 'text', text: generateAuthInstructions(connectionId, baseUrl) }] }
+			}
+
+			// Build a dedicated DiscogsClient + rate-limiter stub the same way the
+			// scheduled handler does. The module-level `discogsClient` above is
+			// shared across tool invocations and already wired to the rate limiter,
+			// but constructing a fresh one here keeps the refresh path symmetric
+			// with src/index-oauth.ts's scheduled() and avoids reaching across the
+			// optional CachedDiscogsClient wrapper.
+			const refreshDiscogs = new DiscogsClient()
+			if (env.RATE_LIMITER) {
+				const rlId = env.RATE_LIMITER.idFromName('discogs-rate-limiter')
+				refreshDiscogs.setRateLimiter(env.RATE_LIMITER.get(rlId))
+			}
+
+			const syncClient: SyncClient = {
+				fetchCollectionPage: (opts) =>
+					refreshDiscogs.searchCollection(
+						session.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						{ page: opts.page, per_page: opts.per_page, sort: 'added', sort_order: 'desc' },
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+					),
+			}
+
+			// Force a full sync. If a stalled progress key exists, syncCollection
+			// resumes it and returns outcome: 'resumed' — surface verbatim so the
+			// user knows partial work was salvaged. Concurrent calls race harmlessly:
+			// each one drives the same sync forward; the second arrival just sees a
+			// more advanced progress key.
+			//
+			// A failed sync carries the message of the page fetch that stopped it.
+			// When that is the rate limiter's circuit breaker, the message includes
+			// retryAfterSecs, and without it a throttled sync and a dead one both
+			// read as "failed" with the same page count.
+			let result: SyncResult
+			try {
+				result = await syncCollection(syncClient, env.MCP_SESSIONS, session.numericId, { force: true })
+			} catch (err) {
+				// Recorded so get_cache_stats shows the crash; the tool still fails as before.
+				const error = err instanceof Error ? err.message : String(err)
+				await recordSyncOutcome(env.MCP_SESSIONS, session.numericId, { outcome: 'crashed', pagesFetched: 0, error }, 'manual')
+				throw err
+			}
+			await recordSyncOutcome(env.MCP_SESSIONS, session.numericId, result, 'manual')
+			const nextSteps = buildNextSteps([
+				{ tool: 'search_collection', args: 'query="..."', hint: 'newly cached items are now searchable' },
+				{ tool: 'get_collection_stats', args: '', hint: 'see updated totals' },
+			])
+			const content: Array<{ type: 'text'; text: string }> = [
+				{
+					type: 'text',
+					text: JSON.stringify({
+						status: result.outcome,
+						count: result.count,
+						fetchedAt: result.fetchedAt,
+						pagesFetched: result.pagesFetched,
+						...(result.error ? { error: result.error } : {}),
+						...(result.syncedThroughPage !== undefined
+							? { syncedThroughPage: result.syncedThroughPage, totalPages: result.totalPages }
+							: {}),
+					}),
+				},
+			]
+			if (nextSteps) {
+				content.push({ type: 'text', text: nextSteps.trimStart() })
+			}
+			return { content }
+		},
+	)
+
+	server.registerTool(
+		'search_collection',
+		{
+			description: "Search your Discogs collection with natural language queries. IMPORTANT: Pass the user's query as-is — do NOT rewrite, decompose, or make multiple searches. The tool handles semantic/conceptual queries internally (e.g., 'strong empowering female voice', 'perfect for a rainy Sunday') by first attempting a keyword match, then returning the collection for LLM-based selection if no matches are found. Also supports mood descriptors like 'mellow jazz', temporal terms like 'recent' or 'oldest', and specific searches by artist, album, genre, or year. One call is sufficient for any query.",
+			annotations: READ_ONLY,
+			inputSchema: z.object({
+				query: z
+					.string()
+					.describe(
+						"The user's search query passed verbatim. Do NOT rewrite or decompose the query — pass it exactly as the user said it. The tool handles semantic queries like 'empowering female vocals' or 'road trip music' by first trying keyword matching, then falling back to collection search if needed.",
+					),
+				per_page: z.number().min(1).max(100).optional().default(50).describe('Number of results to return per page (1-100)'),
+				page: z
+					.number()
+					.min(1)
+					.optional()
+					.default(1)
+					.describe(
+						'1-indexed page number. Combine with per_page to walk through large result sets. The truncation warning emitted at the bottom of each response includes the next page number to request.',
+					),
+				group_pressings: z
+					.boolean()
+					.optional()
+					.default(false)
+					.describe(
+						'When true, collapses every owned pressing of the same master release into one row with aggregated formats. Default false: each pressing the user owns is returned as its own row so distinct release_ids and instance_ids are visible. Set to true when the user wants a compact one-row-per-album view and pressing identity does not matter.',
+					),
+			}),
+		},
+		async ({ query, per_page, page, group_pressings }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				// Get user profile
+				const userProfile = sessionProfile(session)
+
+				// Parse the query once. Disambiguation against the user's collection
+				// happens after we fetch it, in the cached branch below.
+				const parsedEarly = parseSearchQuery(query)
+				let parsed = parsedEarly
+				let temporalInfo = ''
+
+				// Check if query contains mood/contextual language
+				const searchQueries: string[] = [query] // Start with original query
+				let moodInfo = ''
+
+				if (hasMoodContent(query)) {
+					const moodAnalysis = analyzeMoodQuery(query)
+					if (moodAnalysis.confidence >= 0.3) {
+						// Add mood-based search terms while preserving original query
+						const moodTerms = generateMoodSearchTerms(query)
+						if (moodTerms.length > 0) {
+							searchQueries.push(...moodTerms.slice(0, 3)) // Add top 3 mood-based terms
+							moodInfo = `\n**Mood Analysis:** Detected "${moodAnalysis.detectedMoods.join(', ')}" - searching for ${moodTerms.slice(0, 3).join(', ')}\n`
+						}
+					}
+				}
+
+				// OPTIMIZATION: When cached client is available, fetch the complete
+				// collection ONCE and filter in-memory for all query variants.
+				// This avoids paginating the entire collection via API for every search.
+				const allResults: DiscogsCollectionItem[] = []
+				const seenReleaseIds = new Set<string>()
+				let allReleases: DiscogsCollectionItem[] = []
+				let collectionTruncationNote = ''
+				let relevanceScores: Map<string, number> | undefined
+
+				if (cachedClient) {
+					// Fetch complete collection with auto-retry so large collections don't exceed the 45s MCP timeout.
+					// Cached pages are free (~10ms from KV), so retries only spend budget on uncached pages.
+					const toolStart = Date.now()
+					const TOOL_BUDGET_MS = 105000 // 105s total; raised from 40s so full collection fetch finishes under rate-limit pressure
+
+					let collection = await cachedClient.getCompleteCollection(
+						session.numericId,
+						userProfile.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+						50,
+						110000,
+					)
+					while (collection.partial && Date.now() - toolStart < TOOL_BUDGET_MS - 5000) {
+						const remaining = Math.max(TOOL_BUDGET_MS - (Date.now() - toolStart), 5000)
+						collection = await cachedClient.getCompleteCollection(
+							session.numericId,
+							userProfile.username,
+							session.accessToken,
+							session.accessTokenSecret,
+							env.DISCOGS_CONSUMER_KEY,
+							env.DISCOGS_CONSUMER_SECRET,
+							50,
+							remaining,
+						)
+					}
+
+					allReleases = collection.releases
+					if (collection.partial || collection.pagination.items > collection.releases.length) {
+						collectionTruncationNote = `\n\n⚠️ Your collection has ${collection.pagination.items} releases but only ${collection.releases.length} were indexed. Some results may be missing.`
+					}
+
+					// Semantic query detection: if the query is conceptual/descriptive
+					// (not matching artists, albums, genres, or moods), try a best-effort
+					// keyword filter first. Only fall back to the capped LLM dump if:
+					// (a) the user explicitly asked for a broader search, or
+					// (b) the best-effort filter found no results.
+					if (isSemanticQuery(query, allReleases) || shouldUseBroadSearch(query)) {
+						if (!shouldUseBroadSearch(query)) {
+							// Best-effort: run filterReleasesInMemory once per extracted term (OR logic)
+							const semanticTerms = extractSemanticFilterTerms(query)
+							const bestEffortResults: DiscogsCollectionItem[] = []
+							const bestEffortSeen = new Set<string>()
+
+							for (const term of semanticTerms) {
+								const termResults = filterReleasesInMemory(allReleases, term)
+								for (const release of termResults) {
+									const key = `${release.id}-${release.instance_id}`
+									if (!bestEffortSeen.has(key)) {
+										bestEffortSeen.add(key)
+										bestEffortResults.push(release)
+									}
+								}
+							}
+
+							if (bestEffortResults.length > 0) {
+								// Sort by rating desc, then date added desc
+								bestEffortResults.sort((a, b) => {
+									if (a.rating !== b.rating) return b.rating - a.rating
+									return new Date(b.date_added).getTime() - new Date(a.date_added).getTime()
+								})
+
+								const startIdx = (page - 1) * per_page
+								const finalResults = bestEffortResults.slice(startIdx, startIdx + per_page)
+								if (finalResults.length === 0) {
+									return {
+										content: [{
+											type: 'text' as const,
+											text: buildOutOfRangeNote(query, bestEffortResults.length, page, per_page),
+										}],
+									}
+								}
+								const summary = `Found ${bestEffortResults.length} possible matches for "${query}" in your collection (page ${page}, showing ${finalResults.length} items):`
+
+								const releaseList = finalResults
+									.map((release) => {
+										const info = release.basic_information
+										const artists = info.artists.map((a) => a.name).join(', ')
+										const formats = info.formats.map((f) => f.name).join(', ')
+										const genres = info.genres?.length ? info.genres.join(', ') : 'Unknown'
+										const styles = info.styles?.length ? ` | Styles: ${info.styles.join(', ')}` : ''
+										const rating = release.rating > 0 ? ` ⭐${release.rating}` : ''
+										return `• [ID: ${release.id}] [Instance: ${release.instance_id}] ${artists} - ${info.title} (${info.year})\n  Format: ${formats} | Genre: ${genres}${styles}${rating}`
+									})
+									.join('\n\n')
+
+								const broadSearchHint = `\n\n💡 Showing possible matches based on keywords. If these aren't what you're looking for, ask me to "search more broadly" and I'll look through your full collection.`
+								const resultTruncationNote = buildResultTruncationNote(query, bestEffortResults.length, page, per_page)
+
+								return {
+									content: [{
+										type: 'text' as const,
+										text: `${summary}\n${releaseList}${broadSearchHint}${resultTruncationNote}${collectionTruncationNote}`,
+									}],
+								}
+							}
+							// Fall through to capped LLM dump — no best-effort results found
+						}
+
+						// Capped LLM dump: broad search requested, or best-effort found nothing
+						const semanticResult = formatCollectionForSemanticSearch(allReleases, query)
+						if (collectionTruncationNote && semanticResult.content?.[0]?.type === 'text') {
+							semanticResult.content[0].text += collectionTruncationNote
+						}
+						return semanticResult
+					}
+
+					// Disambiguate temporal tokens against the user's actual collection
+					// before deciding the search strategy. Words like "new" are temporal
+					// triggers in isolation but literal title words in queries like
+					// "Lee Morgan Search For The New Land" (#22).
+					parsed = clearTemporalIfTokenIsLiteral(query, parsedEarly, allReleases)
+					const useRelevanceRanking =
+						!parsed.isMoodQuery && !parsed.hasRecent && !parsed.hasOld
+
+					if (useRelevanceRanking) {
+						// MiniSearch handles AND-style filtering and BM25 scoring.
+						const index = buildIndex(allReleases)
+						relevanceScores = searchIndex(index, query)
+						const itemsByKey = new Map<string, DiscogsCollectionItem>()
+						for (const item of allReleases) {
+							itemsByKey.set(`${item.id}:${item.instance_id}`, item)
+						}
+						for (const key of relevanceScores.keys()) {
+							const item = itemsByKey.get(key)
+							if (!item) continue
+							const releaseKey = `${item.id}-${item.instance_id}`
+							if (!seenReleaseIds.has(releaseKey)) {
+								seenReleaseIds.add(releaseKey)
+								allResults.push(item)
+							}
+						}
+					} else {
+						// Mood / temporal queries: keyword filter against mood-expanded variants.
+						for (const searchQuery of searchQueries) {
+							const filtered = filterReleasesInMemory(allReleases, searchQuery, {
+								hasRecent: parsed.hasRecent,
+								hasOld: parsed.hasOld,
+								sort: parsed.hasRecent || parsed.hasOld ? 'added' : undefined,
+								sortOrder: parsed.hasRecent ? 'desc' : parsed.hasOld ? 'asc' : undefined,
+							})
+
+							for (const release of filtered) {
+								const releaseKey = `${release.id}-${release.instance_id}`
+								if (!seenReleaseIds.has(releaseKey)) {
+									seenReleaseIds.add(releaseKey)
+									allResults.push(release)
+								}
+							}
+						}
+					}
+				} else {
+					// Single query or no cached client: use the existing search path
+					// (which still benefits from per-page caching when available)
+					for (const searchQuery of searchQueries) {
+						const searchResults = await client.searchCollection(
+							userProfile.username,
+							session.accessToken,
+							session.accessTokenSecret,
+							{
+								query: searchQuery,
+								per_page,
+							},
+							env.DISCOGS_CONSUMER_KEY,
+							env.DISCOGS_CONSUMER_SECRET,
+						)
+
+						for (const release of searchResults.releases) {
+							const releaseKey = `${release.id}-${release.instance_id}`
+							if (!seenReleaseIds.has(releaseKey)) {
+								seenReleaseIds.add(releaseKey)
+								allResults.push(release)
+							}
+						}
+					}
+				}
+
+				// Build the temporal-strategy banner from the (possibly disambiguated)
+				// parsed query so it doesn't fire for literal title-word queries.
+				if (parsed.hasRecent) {
+					temporalInfo = `\n**Search Strategy:** Interpreted "${query}" as searching for items with "recent" meaning "most recently added". Sorting by date added (newest first).\n`
+				} else if (parsed.hasOld) {
+					temporalInfo = `\n**Search Strategy:** Interpreted "${query}" as searching for items with "old/oldest" meaning "earliest added". Sorting by date added (oldest first).\n`
+				}
+
+				// Run the ranking pipeline: explicit-term filter → score → dedup by master → sort.
+				// Temporal queries bypass dedup and mood scoring.
+				const rankedResults: DedupedCollectionItem[] = applySearchPipeline(allResults, parsed, {
+					relevanceScores,
+					groupPressings: group_pressings,
+				})
+
+				// Slice to requested page
+				const startIdx = (page - 1) * per_page
+				const finalResults = rankedResults.slice(startIdx, startIdx + per_page)
+				if (finalResults.length === 0 && rankedResults.length > 0) {
+					return {
+						content: [{
+							type: 'text',
+							text: buildOutOfRangeNote(query, rankedResults.length, page, per_page),
+						}],
+					}
+				}
+
+				const summary = `Found ${allResults.length} results for "${query}" in your collection (page ${page}, showing ${finalResults.length} items):`
+
+				// Create concise formatted list with genres and styles
+				const releaseList = finalResults
+					.map((release) => {
+						const info = release.basic_information
+						const artists = info.artists.map((a) => a.name).join(', ')
+						const formats =
+							release.ownedFormats && release.ownedFormats.length > 0
+								? release.ownedFormats.join(', ')
+								: info.formats.map((f) => f.name).join(', ')
+						const genres = info.genres?.length ? info.genres.join(', ') : 'Unknown'
+						const styles = info.styles?.length ? ` | Styles: ${info.styles.join(', ')}` : ''
+						const rating = release.rating > 0 ? ` ⭐${release.rating}` : ''
+
+						return `• [ID: ${release.id}] [Instance: ${release.instance_id}] ${artists} - ${info.title} (${info.year})\n  Format: ${formats} | Genre: ${genres}${styles}${rating}`
+					})
+					.join('\n\n')
+
+				const resultTruncationNote = buildResultTruncationNote(query, allResults.length, page, per_page)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'get_release', args: 'release_id=<ID>', hint: 'expand a hit using the [ID: ...] from the list above' },
+					{ tool: 'rate_release', args: 'instance_id=<INSTANCE>, folder_id=<FOLDER>, rating=1..5', hint: 'rate one of these items in your collection' },
+					{ tool: 'move_release', args: 'release_id=<ID>, instance_id=<INSTANCE>, source_folder_id=<FROM>, destination_folder_id=<TO>', hint: 'move a hit to another folder' },
+					{ tool: 'remove_from_collection', args: 'release_id=<ID>, instance_id=<INSTANCE>, folder_id=<FOLDER>', hint: 'drop a hit from your collection' },
+				])
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `${summary}${temporalInfo}${moodInfo}\n${releaseList}${resultTruncationNote}${collectionTruncationNote}${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to search collection: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: get_release
+	 * Get detailed information about a specific release
+	 */
+	server.registerTool(
+		'get_release',
+		{
+			description: 'Get detailed information about a specific release from Discogs, including tracklist, formats, labels, and more.',
+			annotations: READ_ONLY,
+			inputSchema: z.object({
+				release_id: z.string().describe('The Discogs release ID (e.g., from search results)'),
+			}),
+		},
+		async ({ release_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const release = await client.getRelease(
+					release_id,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const artists = (release.artists || []).map((a) => a.name).join(', ')
+				const formats = (release.formats || []).map((f) => `${f.name} (${f.qty})`).join(', ')
+				const genres = (release.genres || []).join(', ')
+				const styles = (release.styles || []).join(', ')
+				const labels = (release.labels || []).map((l) => `${l.name} (${l.catno})`).join(', ')
+
+				let text = `**${artists} - ${release.title}**\n\n`
+				text += `Year: ${release.year || 'Unknown'}\n`
+				text += `Formats: ${formats}\n`
+				text += `Genres: ${genres}\n`
+				if (styles) text += `Styles: ${styles}\n`
+				text += `Labels: ${labels}\n`
+				if (release.country) text += `Country: ${release.country}\n`
+
+				if (release.tracklist && release.tracklist.length > 0) {
+					text += `\n**Tracklist:**\n`
+					release.tracklist.forEach((track) => {
+						text += `${track.position}. ${track.title}`
+						if (track.duration) text += ` (${track.duration})`
+						text += '\n'
+					})
+				}
+
+				text += buildNextSteps([
+					{ tool: 'add_to_collection', args: `release_id=${release_id}, folder_id=<FOLDER>`, hint: 'add this release to a folder in your collection' },
+					{ tool: 'rate_release', args: 'instance_id=<INSTANCE>, folder_id=<FOLDER>, rating=1..5', hint: 'rate this release if you already own it (instance_id comes from search_collection)' },
+					{ tool: 'search_discogs', args: `query="${artists}", type="master"`, hint: 'find more from this artist on Discogs' },
+					{ tool: 'search_collection', args: `query="${artists}"`, hint: 'check what you already own by this artist' },
+				])
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to get release: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: search_discogs
+	 * Search the Discogs-wide catalog (not limited to the user's collection)
+	 */
+	server.registerTool(
+		'search_discogs',
+		{
+			description: "Search the Discogs-wide catalog for releases, masters, artists, or labels (not limited to your collection). Use this to look up albums, artists, or releases that you don't own. If you want to search only what you own, use search_collection instead.",
+			annotations: READ_ONLY,
+			inputSchema: z.object({
+				query: z
+					.string()
+					.describe('Free-text search query — artist name, album title, catalog number, etc.'),
+				type: z
+					.enum(['release', 'master', 'artist', 'label'])
+					.optional()
+					.default('master')
+					.describe(
+						"What kind of entity to search for. Default: master (the canonical album, independent of pressing). Use 'release' to find a specific pressing, 'artist' or 'label' for those entities.",
+					),
+				per_page: z
+					.number()
+					.min(1)
+					.max(100)
+					.optional()
+					.default(10)
+					.describe('Number of results to return (1-100). Default: 10.'),
+			}),
+		},
+		async ({ query, type, per_page }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				// Search the Discogs-wide database.
+				const searchResponse = await client.searchDatabase(
+					query,
+					session.accessToken,
+					session.accessTokenSecret,
+					{ type, per_page },
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				// Best-effort: fetch the user's collection and build owned-id sets so
+				// we can mark which results the user already owns. If anything fails,
+				// skip the marker rather than failing the whole tool.
+				let ownedMasterIds = new Set<number>()
+				let ownedReleaseIds = new Set<number>()
+				if (cachedClient) {
+					try {
+						const userProfile = sessionProfile(session)
+						const toolStart = Date.now()
+						const TOOL_BUDGET_MS = 105000
+						let collection = await cachedClient.getCompleteCollection(
+							session.numericId,
+							userProfile.username,
+							session.accessToken,
+							session.accessTokenSecret,
+							env.DISCOGS_CONSUMER_KEY,
+							env.DISCOGS_CONSUMER_SECRET,
+							50,
+							110000,
+						)
+						while (collection.partial && Date.now() - toolStart < TOOL_BUDGET_MS - 5000) {
+							const remaining = Math.max(TOOL_BUDGET_MS - (Date.now() - toolStart), 5000)
+							collection = await cachedClient.getCompleteCollection(
+								session.numericId,
+								userProfile.username,
+								session.accessToken,
+								session.accessTokenSecret,
+								env.DISCOGS_CONSUMER_KEY,
+								env.DISCOGS_CONSUMER_SECRET,
+								50,
+								remaining,
+							)
+						}
+						for (const item of collection.releases) {
+							if (item.basic_information.master_id) {
+								ownedMasterIds.add(item.basic_information.master_id)
+							}
+							ownedReleaseIds.add(item.id)
+						}
+					} catch {
+						// Collection fetch failed — fall through with empty sets.
+						ownedMasterIds = new Set<number>()
+						ownedReleaseIds = new Set<number>()
+					}
+				}
+
+				const text = formatSearchDiscogsResults(searchResponse, ownedMasterIds, ownedReleaseIds, query, type)
+				const nextSteps = buildNextSteps([
+					{ tool: 'get_release', args: 'release_id=<ID>', hint: 'expand a hit (use the release ID from the list above)' },
+					{ tool: 'add_to_collection', args: 'release_id=<ID>, folder_id=<FOLDER>', hint: 'add a hit to your collection (call list_folders first if you need a folder_id)' },
+					{ tool: 'search_collection', args: `query="${query}"`, hint: 'cross-reference against what you already own' },
+				])
+				return {
+					content: [{ type: 'text', text: text + nextSteps }],
+				}
+			} catch (error) {
+				throw new Error(`Failed to search Discogs: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: get_collection_stats
+	 * Get statistics about user's collection
+	 */
+	server.registerTool(
+		'get_collection_stats',
+		{
+			description: 'Get comprehensive statistics about your Discogs collection including genre breakdown, decade analysis, format distribution, and ratings.',
+			annotations: READ_ONLY,
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				// Compute stats from cached complete collection when available.
+				// This reuses the same cached dataset as search_collection and
+				// get_recommendations, so if either was called first, this is free.
+				let stats
+				let collectionTotalItems = 0
+				let collectionIndexedItems = 0
+				if (cachedClient) {
+					const toolStart = Date.now()
+					const TOOL_BUDGET_MS = 105000
+
+					let collection = await cachedClient.getCompleteCollection(
+						session.numericId,
+						userProfile.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+						50,
+						110000,
+					)
+					while (collection.partial && Date.now() - toolStart < TOOL_BUDGET_MS - 5000) {
+						const remaining = Math.max(TOOL_BUDGET_MS - (Date.now() - toolStart), 5000)
+						collection = await cachedClient.getCompleteCollection(
+							session.numericId,
+							userProfile.username,
+							session.accessToken,
+							session.accessTokenSecret,
+							env.DISCOGS_CONSUMER_KEY,
+							env.DISCOGS_CONSUMER_SECRET,
+							50,
+							remaining,
+						)
+					}
+
+					stats = cachedClient.computeStatsFromReleases(collection.releases)
+					collectionTotalItems = collection.pagination.items
+					collectionIndexedItems = collection.releases.length
+				} else {
+					stats = await client.getCollectionStats(
+						userProfile.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+					)
+					collectionTotalItems = stats.totalReleases
+					collectionIndexedItems = stats.totalReleases
+				}
+
+				const isIncomplete = collectionTotalItems > collectionIndexedItems
+
+				let text = `**Collection Statistics for ${userProfile.username}**\n\n`
+				if (isIncomplete) {
+					text += `Total Releases: ${collectionIndexedItems} indexed of ${collectionTotalItems} total\n`
+				} else {
+					text += `Total Releases: ${stats.totalReleases}\n`
+				}
+				text += `Average Rating: ${stats.averageRating.toFixed(1)} (${stats.ratedReleases} rated releases)\n\n`
+
+				text += `**Top Genres:**\n`
+				const topGenres = Object.entries(stats.genreBreakdown)
+					.sort(([, a], [, b]) => b - a)
+					.slice(0, 5)
+				topGenres.forEach(([genre, count]) => {
+					text += `• ${genre}: ${count} releases\n`
+				})
+
+				text += `\n**By Decade:**\n`
+				const topDecades = Object.entries(stats.decadeBreakdown)
+					.sort(([, a], [, b]) => b - a)
+					.slice(0, 5)
+				topDecades.forEach(([decade, count]) => {
+					text += `• ${decade}: ${count} releases\n`
+				})
+
+				text += `\n**Top Formats:**\n`
+				const topFormats = Object.entries(stats.formatBreakdown)
+					.sort(([, a], [, b]) => b - a)
+					.slice(0, 5)
+				topFormats.forEach(([format, count]) => {
+					text += `• ${format}: ${count} releases\n`
+				})
+
+				if (isIncomplete) {
+					text += `\n⚠️ Only ${collectionIndexedItems} of your ${collectionTotalItems} releases have been indexed. Stats above reflect the indexed portion only.`
+				}
+
+				text += buildNextSteps([
+					{ tool: 'search_collection', args: 'query="<genre or decade>"', hint: 'drill into a slice of the collection' },
+					{ tool: 'get_recommendations', args: 'genre="<top genre>"', hint: 'pull picks from a top-genre slice' },
+					{ tool: 'list_folders', args: '', hint: 'see how your collection is organized' },
+				])
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to get collection stats: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: get_recommendations
+	 * Get personalized music recommendations with mood support
+	 */
+	server.registerTool(
+		'get_recommendations',
+		{
+			description: "Get personalized music recommendations from your collection based on genre, decade, mood, or similarity to other releases. Supports mood-aware filtering with descriptors like 'mellow', 'energetic', 'melancholic'.",
+			annotations: READ_ONLY,
+			inputSchema: z.object({
+				limit: z.number().min(1).max(50).optional().default(10).describe('Number of recommendations to return (1-50)'),
+				genre: z.string().optional().describe("Filter by genre or mood descriptor (e.g., 'jazz', 'mellow', 'energetic')"),
+				decade: z.string().optional().describe("Filter by decade (e.g., '1970s', '1980')"),
+				similar_to: z.string().optional().describe('Find releases similar to this artist/album (searches by musical characteristics)'),
+				query: z.string().optional().describe('Additional search query or mood descriptor to refine recommendations'),
+				format: z.string().optional().describe("Filter by format (e.g., 'Vinyl', 'CD', 'Cassette')"),
+			}),
+		},
+		async ({ limit, genre, decade, similar_to, query, format }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				// Analyze mood content in parameters to enhance filtering
+				let moodGenres: string[] = []
+				let moodStyles: string[] = []
+				let moodInfo = ''
+
+				// Check for mood content in query parameter
+				if (query && hasMoodContent(query)) {
+					const moodAnalysis = analyzeMoodQuery(query)
+					if (moodAnalysis.confidence >= 0.3) {
+						moodGenres = moodAnalysis.suggestedGenres
+						moodStyles = moodAnalysis.suggestedStyles
+						moodInfo = `\n**Mood Analysis:** Detected "${moodAnalysis.detectedMoods.join(', ')}"${moodAnalysis.contextualHints.length ? ` (${moodAnalysis.contextualHints.join(', ')})` : ''}\n`
+					}
+				}
+
+				// Also check genre parameter for mood terms
+				if (genre && hasMoodContent(genre)) {
+					const genreMoodAnalysis = analyzeMoodQuery(genre)
+					if (genreMoodAnalysis.confidence >= 0.3) {
+						moodGenres = [...moodGenres, ...genreMoodAnalysis.suggestedGenres]
+						moodStyles = [...moodStyles, ...genreMoodAnalysis.suggestedStyles]
+						if (!moodInfo) {
+							moodInfo = `\n**Mood Analysis:** Detected "${genreMoodAnalysis.detectedMoods.join(', ')}" in genre filter\n`
+						}
+					}
+				}
+
+				// Remove duplicates from mood mappings
+				moodGenres = [...new Set(moodGenres)]
+				moodStyles = [...new Set(moodStyles)]
+
+				const userProfile = sessionProfile(session)
+
+				// Get full collection for context-aware recommendations.
+				// Uses getCompleteCollectionReleases() when cached client is available
+				// (single fetch, cached for 45 min) instead of manual pagination.
+				let allReleases: DiscogsCollectionItem[]
+				if (cachedClient) {
+					const toolStart = Date.now()
+					const TOOL_BUDGET_MS = 105000
+
+					let collectionResult = await cachedClient.getCompleteCollectionReleases(
+						session.numericId,
+						userProfile.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+						110000,
+					)
+					while (collectionResult.partial && Date.now() - toolStart < TOOL_BUDGET_MS - 5000) {
+						const remaining = Math.max(TOOL_BUDGET_MS - (Date.now() - toolStart), 5000)
+						collectionResult = await cachedClient.getCompleteCollectionReleases(
+							session.numericId,
+							userProfile.username,
+							session.accessToken,
+							session.accessTokenSecret,
+							env.DISCOGS_CONSUMER_KEY,
+							env.DISCOGS_CONSUMER_SECRET,
+							remaining,
+						)
+					}
+					allReleases = collectionResult.releases
+				} else {
+					// Fallback: manual pagination when no cached client
+					const fullCollection = await client.searchCollection(
+						userProfile.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						{ per_page: 100 },
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+					)
+					allReleases = fullCollection.releases
+					for (let page = 2; page <= fullCollection.pagination.pages; page++) {
+						const pageResults = await client.searchCollection(
+							userProfile.username,
+							session.accessToken,
+							session.accessTokenSecret,
+							{ page, per_page: 100 },
+							env.DISCOGS_CONSUMER_KEY,
+							env.DISCOGS_CONSUMER_SECRET,
+						)
+						allReleases = allReleases.concat(pageResults.releases)
+					}
+				}
+
+				// Filter releases based on context parameters
+				let filteredReleases = allReleases
+
+				// Filter by genre (enhanced with mood mapping)
+				if (genre || moodGenres.length > 0) {
+					filteredReleases = filteredReleases.filter((release) => {
+						const releaseGenres = release.basic_information.genres?.map((g) => g.toLowerCase()) || []
+						const releaseStyles = release.basic_information.styles?.map((s) => s.toLowerCase()) || []
+
+						// Original genre matching (if genre parameter provided)
+						let genreMatch = false
+						if (genre) {
+							const genreTerms = genre
+								.toLowerCase()
+								.split(/[\s,;|&]+/)
+								.filter((term) => term.length > 0)
+							genreMatch = genreTerms.some(
+								(term) => releaseGenres.some((g) => g.includes(term)) || releaseStyles.some((s) => s.includes(term)),
+							)
+						}
+
+						// Mood-based genre matching
+						let moodMatch = false
+						if (moodGenres.length > 0 || moodStyles.length > 0) {
+							const lowerMoodGenres = moodGenres.map((g) => g.toLowerCase())
+							const lowerMoodStyles = moodStyles.map((s) => s.toLowerCase())
+
+							moodMatch =
+								releaseGenres.some((g) => lowerMoodGenres.some((mg) => g.includes(mg) || mg.includes(g))) ||
+								releaseStyles.some((s) => lowerMoodStyles.some((ms) => s.includes(ms) || ms.includes(s)))
+						}
+
+						// Return true if either genre or mood criteria match
+						if (genre && (moodGenres.length > 0 || moodStyles.length > 0)) {
+							return genreMatch || moodMatch
+						} else if (genre) {
+							return genreMatch
+						} else {
+							return moodMatch
+						}
+					})
+				}
+
+				// Filter by decade
+				if (decade) {
+					const decadeNum = parseInt(decade.replace(/s$/, ''))
+					if (!isNaN(decadeNum)) {
+						filteredReleases = filteredReleases.filter((release) => {
+							const year = release.basic_information.year
+							return year && year >= decadeNum && year < decadeNum + 10
+						})
+					}
+				}
+
+				// Filter by format
+				if (format) {
+					filteredReleases = filteredReleases.filter((release) => {
+						return release.basic_information.formats?.some((f) => f.name.toLowerCase().includes(format.toLowerCase()))
+					})
+				}
+
+				// Filter by similarity (complex logic preserved from original)
+				if (similar_to) {
+					const similarTerms = similar_to
+						.toLowerCase()
+						.split(/\s+/)
+						.filter((term) => term.length > 2)
+
+					const referenceReleases = filteredReleases.filter((release) => {
+						const info = release.basic_information
+						const searchableText = [
+							...(info.artists?.map((artist) => artist.name) || []),
+							info.title,
+							...(info.genres || []),
+							...(info.styles || []),
+							...(info.labels?.map((label) => label.name) || []),
+						]
+							.join(' ')
+							.toLowerCase()
+
+						const matchingTerms = similarTerms.filter((term) => searchableText.includes(term)).length
+						return matchingTerms >= Math.ceil(similarTerms.length * 0.5)
+					})
+
+					if (referenceReleases.length > 0) {
+						// Extract musical characteristics from reference releases
+						const refGenres = new Set<string>()
+						const refStyles = new Set<string>()
+						const refArtists = new Set<string>()
+						let refEraStart = Infinity
+						let refEraEnd = 0
+
+						referenceReleases.forEach((release) => {
+							const info = release.basic_information
+							info.genres?.forEach((g) => refGenres.add(g.toLowerCase()))
+							info.styles?.forEach((s) => refStyles.add(s.toLowerCase()))
+							info.artists?.forEach((a) => refArtists.add(a.name.toLowerCase()))
+							if (info.year) {
+								refEraStart = Math.min(refEraStart, info.year)
+								refEraEnd = Math.max(refEraEnd, info.year)
+							}
+						})
+
+						// Expand era window by ±5 years
+						const eraBuffer = 5
+						refEraStart = refEraStart === Infinity ? 0 : refEraStart - eraBuffer
+						refEraEnd = refEraEnd === 0 ? 9999 : refEraEnd + eraBuffer
+
+						// Find releases with similar musical characteristics
+						filteredReleases = filteredReleases.filter((release) => {
+							const info = release.basic_information
+							let similarityScore = 0
+
+							// Genre matching (highest weight)
+							const releaseGenres = (info.genres || []).map((g) => g.toLowerCase())
+							const genreMatches = releaseGenres.filter((g) => refGenres.has(g)).length
+							if (genreMatches > 0) similarityScore += genreMatches * 3
+
+							// Style matching (high weight)
+							const releaseStyles = (info.styles || []).map((s) => s.toLowerCase())
+							const styleMatches = releaseStyles.filter((s) => refStyles.has(s)).length
+							if (styleMatches > 0) similarityScore += styleMatches * 2
+
+							// Era matching (medium weight)
+							const releaseYear = info.year || 0
+							if (releaseYear >= refEraStart && releaseYear <= refEraEnd) {
+								similarityScore += 1
+							}
+
+							// Artist collaboration (bonus)
+							const releaseArtists = (info.artists || []).map((a) => a.name.toLowerCase())
+							const artistMatches = releaseArtists.filter((a) => refArtists.has(a)).length
+							if (artistMatches > 0) similarityScore += artistMatches * 1
+
+							return similarityScore >= 2
+						})
+					}
+				}
+
+				// Filter by general query
+				if (query) {
+					const queryTerms = query
+						.toLowerCase()
+						.split(/\s+/)
+						.filter((term) => term.length > 2)
+
+					// Genre/style/mood terms for OR logic
+					const genreStyleTerms = [
+						'ambient',
+						'drone',
+						'progressive',
+						'rock',
+						'jazz',
+						'blues',
+						'electronic',
+						'techno',
+						'house',
+						'metal',
+						'punk',
+						'folk',
+						'country',
+						'classical',
+						'hip',
+						'hop',
+						'rap',
+						'soul',
+						'funk',
+						'disco',
+						'reggae',
+						'ska',
+						'indie',
+						'alternative',
+						'psychedelic',
+						'experimental',
+						'moody',
+						'melancholy',
+						'energetic',
+						'upbeat',
+						'mellow',
+						'chill',
+						'relaxing',
+						'dark',
+						'romantic',
+					]
+
+					const isGenreStyleMoodQuery = queryTerms.some((term) => genreStyleTerms.includes(term.toLowerCase()))
+
+					filteredReleases = filteredReleases.filter((release) => {
+						const info = release.basic_information
+						const searchableText = [
+							...(info.artists?.map((artist) => artist.name) || []),
+							info.title,
+							...(info.genres || []),
+							...(info.styles || []),
+							...(info.labels?.map((label) => label.name) || []),
+						]
+							.join(' ')
+							.toLowerCase()
+
+						if (isGenreStyleMoodQuery) {
+							// OR logic for genre/style/mood
+							const matchingTerms = queryTerms.filter((term) => searchableText.includes(term)).length
+							return matchingTerms >= 1
+						} else {
+							// Require 50% match for other queries
+							const matchingTerms = queryTerms.filter((term) => searchableText.includes(term)).length
+							return matchingTerms >= Math.ceil(queryTerms.length * 0.5)
+						}
+					})
+				}
+
+				// Calculate relevance scores for query-based searches
+				if (query) {
+					const queryTerms = query
+						.toLowerCase()
+						.split(/\s+/)
+						.filter((term) => term.length > 2)
+
+					filteredReleases = filteredReleases
+						.map((release): ReleaseWithRelevance => {
+							const info = release.basic_information
+							const searchableText = [
+								...(info.artists?.map((artist) => artist.name) || []),
+								info.title,
+								...(info.genres || []),
+								...(info.styles || []),
+								...(info.labels?.map((label) => label.name) || []),
+							]
+								.join(' ')
+								.toLowerCase()
+
+							const matchingTerms = queryTerms.filter((term) => searchableText.includes(term)).length
+							const relevanceScore = matchingTerms / queryTerms.length
+
+							return { ...release, relevanceScore }
+						})
+						.sort((a, b) => {
+							const aRelevance = a.relevanceScore || 0
+							const bRelevance = b.relevanceScore || 0
+							if (aRelevance !== bRelevance) {
+								return bRelevance - aRelevance
+							}
+							if (a.rating !== b.rating) {
+								return b.rating - a.rating
+							}
+							return new Date(b.date_added).getTime() - new Date(a.date_added).getTime()
+						})
+				} else {
+					// Sort by rating and date
+					filteredReleases.sort((a, b) => {
+						if (a.rating !== b.rating) {
+							return b.rating - a.rating
+						}
+						return new Date(b.date_added).getTime() - new Date(a.date_added).getTime()
+					})
+				}
+
+				// Limit results
+				const recommendations = filteredReleases.slice(0, limit)
+
+				// Build response
+				let text = `**Context-Aware Music Recommendations**\n\n`
+
+				if (genre || decade || similar_to || query || format || moodGenres.length > 0) {
+					text += `**Filters Applied:**\n`
+					if (genre) text += `• Genre: ${genre}\n`
+					if (decade) text += `• Decade: ${decade}\n`
+					if (format) text += `• Format: ${format}\n`
+					if (similar_to) text += `• Similar to: ${similar_to}\n`
+					if (query) text += `• Query: ${query}\n`
+					if (moodGenres.length > 0) text += `• Mood-based genres: ${moodGenres.slice(0, 5).join(', ')}\n`
+					text += `\n`
+				}
+
+				if (moodInfo) {
+					text += moodInfo
+				}
+
+				text += `Found ${filteredReleases.length} matching releases in your collection (showing top ${recommendations.length}):\n\n`
+
+				if (recommendations.length === 0) {
+					text += `No releases found matching your criteria. Try:\n`
+					text += `• Broadening your search terms\n`
+					text += `• Using different genres or decades\n`
+					text += `• Searching for specific artists you own\n`
+					text += `• Using mood descriptors like "mellow", "energetic", "melancholy"\n`
+					text += `• Trying contextual terms like "Sunday evening", "rainy day", "workout"\n`
+				} else {
+					recommendations.forEach((release, index) => {
+						const info = release.basic_information
+						const artists = info.artists.map((a) => a.name).join(', ')
+						const formats = info.formats?.map((f) => f.name).join(', ') || 'Unknown'
+						const genres = info.genres?.join(', ') || 'Unknown'
+						const year = info.year || 'Unknown'
+						const rating = release.rating > 0 ? ` ⭐${release.rating}` : ''
+						const relevance =
+							query && 'relevanceScore' in release ? ` (${Math.round((release as ReleaseWithRelevance).relevanceScore! * 100)}% match)` : ''
+
+						text += `${index + 1}. **${artists} - ${info.title}** (${year})${rating}${relevance}\n`
+						text += `   Format: ${formats} | Genres: ${genres}\n`
+						if (info.styles && info.styles.length > 0) {
+							text += `   Styles: ${info.styles.join(', ')}\n`
+						}
+						text += `   Release ID: ${release.id}\n\n`
+					})
+
+				}
+
+				text += buildNextSteps([
+					{ tool: 'get_release', args: 'release_id=<ID>', hint: 'expand a recommendation using its Release ID' },
+					{ tool: 'get_recommendations', args: 'mood="<descriptor>"', hint: 'try a different mood or context filter' },
+					{ tool: 'search_collection', args: 'query="..."', hint: 'free-text search if recommendations missed the mark' },
+				])
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to get recommendations: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: get_cache_stats
+	 * Get cache performance statistics
+	 */
+	server.registerTool(
+		'get_cache_stats',
+		{
+			description: 'Get cache performance statistics including total entries, pending requests, and data type breakdown.',
+			annotations: READ_ONLY,
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				if (!cachedClient) {
+					return {
+						content: [
+							{
+								type: 'text',
+								text: '**Cache Statistics**\n\nCaching is not available - no KV storage configured. All requests go directly to the Discogs API.',
+							},
+						],
+					}
+				}
+
+				const stats = await cachedClient.getCacheStats()
+
+				let text = '**Cache Performance Statistics**\n\n'
+				text += `📊 **Total Cache Entries:** ${stats.totalEntries}\n`
+				text += `⏳ **Pending Requests:** ${stats.pendingRequests}\n\n`
+
+				if (Object.keys(stats.entriesByType).length > 0) {
+					text += '**Cached Data Types:**\n'
+					for (const [type, count] of Object.entries(stats.entriesByType)) {
+						text += `• ${type}: ${count} entries\n`
+					}
+				} else {
+					text += '**No cached data** - Cache is empty or recently cleared\n'
+				}
+
+				// The snapshot and sync progress live outside the cache:* keyspace,
+				// so they are reported separately — this is the only place a user
+				// can see whether the background sync is actually landing.
+				text += '\n**Collection Sync:**\n'
+				for (const line of await describeSyncState(env.MCP_SESSIONS, session.numericId)) {
+					text += `• ${line}\n`
+				}
+
+				text += '\n**Cache Benefits:**\n'
+				text += '• Reduced API calls to Discogs\n'
+				text += '• Faster response times\n'
+				text += '• Better rate limit compliance\n'
+				text += '• Request deduplication for concurrent users\n'
+
+				text += buildNextSteps([
+					{ tool: 'refresh_collection', args: '', hint: 'force a fresh collection sync if cache looks stale' },
+					{ tool: 'server_info', args: '', hint: 'see server version and feature list' },
+				])
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to get cache stats: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	// ──────────────────────────────────────────────
+	// Collection write tools
+	// ──────────────────────────────────────────────
+
+	/**
+	 * Tool: list_folders
+	 * List all collection folders
+	 */
+	server.registerTool(
+		'list_folders',
+		{
+			description: 'List all folders in your Discogs collection. Shows folder ID, name, and release count for each folder. Folder 0 is "All" (virtual), folder 1 is "Uncategorized" (default).',
+			annotations: READ_ONLY,
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				const folders = await client.listFolders(
+					userProfile.username,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				let text = `**Collection Folders for ${userProfile.username}**\n\n`
+				text += `Total folders: ${folders.length}\n\n`
+
+				for (const folder of folders) {
+					text += `• **${folder.name}** (ID: ${folder.id}) — ${folder.count} releases\n`
+				}
+
+				text += buildNextSteps([
+					{ tool: 'create_folder', args: 'name="..."', hint: 'add a new folder' },
+					{ tool: 'edit_folder', args: 'folder_id=<ID>, name="..."', hint: 'rename a folder' },
+					{ tool: 'delete_folder', args: 'folder_id=<ID>', hint: 'remove an empty folder' },
+					{ tool: 'move_release', args: 'release_id=<ID>, instance_id=<INSTANCE>, source_folder_id=<FROM>, destination_folder_id=<TO>', hint: 'move a release between folders' },
+				])
+
+				return {
+					content: [{ type: 'text', text }],
+				}
+			} catch (error) {
+				throw new Error(`Failed to list folders: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: create_folder
+	 * Create a new collection folder
+	 */
+	server.registerTool(
+		'create_folder',
+		{
+			description: 'Create a new folder in your Discogs collection for organizing releases.',
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({
+				name: z.string().min(1).max(100).describe('Name for the new folder'),
+			}),
+		},
+		async ({ name }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				const folder = await client.createFolder(
+					userProfile.username,
+					name,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'move_release', args: `release_id=<ID>, instance_id=<INSTANCE>, source_folder_id=<FROM>, destination_folder_id=${folder.id}`, hint: 'move a release into the new folder' },
+					{ tool: 'list_folders', args: '', hint: 'see all folders' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Created folder **${folder.name}** (ID: ${folder.id})${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to create folder: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: edit_folder
+	 * Rename a collection folder
+	 */
+	server.registerTool(
+		'edit_folder',
+		{
+			description: 'Rename an existing folder in your Discogs collection. Cannot rename the system folders (All or Uncategorized).',
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({
+				folder_id: z.number().min(2).describe('ID of the folder to rename (must be 2 or higher — system folders cannot be renamed)'),
+				name: z.string().min(1).max(100).describe('New name for the folder'),
+			}),
+		},
+		async ({ folder_id, name }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				const folder = await client.editFolder(
+					userProfile.username,
+					folder_id,
+					name,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'list_folders', args: '', hint: 'confirm the rename' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Renamed folder ${folder_id} to **${folder.name}**${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to edit folder: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: delete_folder
+	 * Delete a collection folder (must be empty)
+	 */
+	server.registerTool(
+		'delete_folder',
+		{
+			description: 'Delete a folder from your Discogs collection. The folder must be empty (no releases). Cannot delete system folders (All or Uncategorized).',
+			annotations: DESTRUCTIVE_WRITE,
+			inputSchema: z.object({
+				folder_id: z.number().min(2).describe('ID of the folder to delete (must be 2 or higher — system folders cannot be deleted)'),
+			}),
+		},
+		async ({ folder_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				await client.deleteFolder(
+					userProfile.username,
+					folder_id,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'list_folders', args: '', hint: 'confirm the deletion' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Deleted folder ${folder_id}${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to delete folder: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: add_to_collection
+	 * Add a release to a collection folder
+	 */
+	server.registerTool(
+		'add_to_collection',
+		{
+			description: 'Add a release to a folder in your Discogs collection. If no folder is specified, adds to the Uncategorized folder (ID 1).',
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({
+				release_id: z.number().describe('The Discogs release ID to add'),
+				folder_id: z.number().optional().default(1).describe('Folder ID to add the release to (default: 1 = Uncategorized)'),
+			}),
+		},
+		async ({ release_id, folder_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				const result = await client.addToFolder(
+					userProfile.username,
+					folder_id,
+					release_id,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'rate_release', args: `instance_id=${result.instance_id}, folder_id=${folder_id}, rating=1..5`, hint: 'rate the release you just added' },
+					{ tool: 'list_custom_fields', args: '', hint: 'see custom fields you can fill in for this release' },
+					{ tool: 'get_release', args: `release_id=${release_id}`, hint: 'pull tracklist and full metadata for the release' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Added release ${release_id} to folder ${folder_id} (instance ID: ${result.instance_id})${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to add to collection: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: remove_from_collection
+	 * Remove a release instance from a collection folder
+	 */
+	server.registerTool(
+		'remove_from_collection',
+		{
+			description: 'Remove a specific release instance from a folder in your Discogs collection. Use search_collection to find the instance_id for a release.',
+			annotations: DESTRUCTIVE_WRITE,
+			inputSchema: z.object({
+				folder_id: z.number().describe('Folder ID containing the release'),
+				release_id: z.number().describe('The Discogs release ID'),
+				instance_id: z.number().describe('The specific instance ID to remove (from search_collection results)'),
+			}),
+		},
+		async ({ folder_id, release_id, instance_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				await client.removeFromFolder(
+					userProfile.username,
+					folder_id,
+					release_id,
+					instance_id,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'search_collection', args: 'query="..."', hint: 'verify the release is gone or find another one' },
+					{ tool: 'get_collection_stats', args: '', hint: 'see updated totals' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Removed release ${release_id} (instance ${instance_id}) from folder ${folder_id}${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to remove from collection: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: move_release
+	 * Move a release instance to a different folder
+	 */
+	server.registerTool(
+		'move_release',
+		{
+			description: 'Move a release instance to a different folder in your Discogs collection. Use search_collection to find release and instance IDs, and list_folders to see available folders.',
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({
+				folder_id: z.number().describe('Current folder ID containing the release'),
+				release_id: z.number().describe('The Discogs release ID'),
+				instance_id: z.number().describe('The specific instance ID to move'),
+				target_folder_id: z.number().describe('Destination folder ID'),
+			}),
+		},
+		async ({ folder_id, release_id, instance_id, target_folder_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				await client.editInstance(
+					userProfile.username,
+					folder_id,
+					release_id,
+					instance_id,
+					{ folder_id: target_folder_id },
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'rate_release', args: `instance_id=${instance_id}, folder_id=${target_folder_id}, rating=1..5`, hint: 'rate the release in its new folder' },
+					{ tool: 'list_folders', args: '', hint: 'see updated folder counts' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Moved release ${release_id} (instance ${instance_id}) from folder ${folder_id} to folder ${target_folder_id}${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to move release: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: rate_release
+	 * Rate a release in your collection (0-5 stars)
+	 */
+	server.registerTool(
+		'rate_release',
+		{
+			description: 'Rate a release in your Discogs collection from 0 (no rating) to 5 stars. Use search_collection to find release and instance IDs.',
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({
+				folder_id: z.number().describe('Folder ID containing the release'),
+				release_id: z.number().describe('The Discogs release ID'),
+				instance_id: z.number().describe('The specific instance ID to rate'),
+				rating: z.number().min(0).max(5).describe('Rating from 0 (remove rating) to 5 stars'),
+			}),
+		},
+		async ({ folder_id, release_id, instance_id, rating }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				await client.editInstance(
+					userProfile.username,
+					folder_id,
+					release_id,
+					instance_id,
+					{ rating },
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const ratingText = rating === 0 ? 'Removed rating from' : `Rated ${rating}/5 stars:`
+				const nextSteps = buildNextSteps([
+					{ tool: 'get_release', args: `release_id=${release_id}`, hint: 'pull full metadata for the release you just rated' },
+					{ tool: 'search_collection', args: 'query="..."', hint: 'find another release to rate' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `${ratingText} release ${release_id} (instance ${instance_id})${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to rate release: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: list_custom_fields
+	 * List custom fields defined in the user's collection
+	 */
+	server.registerTool(
+		'list_custom_fields',
+		{
+			description: 'List all custom fields defined in your Discogs collection. Custom fields allow you to add metadata like notes, tags, or categories to releases.',
+			annotations: READ_ONLY,
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				const fields = await client.listCustomFields(
+					userProfile.username,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				if (fields.length === 0) {
+					return {
+						content: [
+							{
+								type: 'text',
+								text: `**Custom Fields for ${userProfile.username}**\n\nNo custom fields defined. You can create custom fields in your Discogs collection settings at discogs.com.`,
+							},
+						],
+					}
+				}
+
+				let text = `**Custom Fields for ${userProfile.username}**\n\n`
+				for (const field of fields) {
+					text += `• **${field.name}** (ID: ${field.id}, type: ${field.type})`
+					if (field.options && field.options.length > 0) {
+						text += `\n  Options: ${field.options.join(', ')}`
+					}
+					text += '\n'
+				}
+
+				text += buildNextSteps([
+					{ tool: 'edit_custom_field', args: 'release_id=<ID>, instance_id=<INSTANCE>, folder_id=<FOLDER>, field_id=<FIELD>, value="..."', hint: 'set a custom field value on a release instance' },
+				])
+
+				return {
+					content: [{ type: 'text', text }],
+				}
+			} catch (error) {
+				throw new Error(`Failed to list custom fields: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: edit_custom_field
+	 * Set a custom field value on a collection instance
+	 */
+	server.registerTool(
+		'edit_custom_field',
+		{
+			description: 'Set a custom field value on a release in your Discogs collection. Use list_custom_fields to see available fields and their IDs. For dropdown fields, the value must match one of the defined options.',
+			annotations: DESTRUCTIVE_WRITE,
+			inputSchema: z.object({
+				folder_id: z.number().describe('Folder ID containing the release'),
+				release_id: z.number().describe('The Discogs release ID'),
+				instance_id: z.number().describe('The specific instance ID'),
+				field_id: z.number().describe('Custom field ID (from list_custom_fields)'),
+				value: z.string().describe('Value to set for the field'),
+			}),
+		},
+		async ({ folder_id, release_id, instance_id, field_id, value }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+
+			if (!session) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: generateAuthInstructions(connectionId, baseUrl),
+						},
+					],
+				}
+			}
+
+			try {
+				const userProfile = sessionProfile(session)
+
+				await client.editCustomFieldValue(
+					userProfile.username,
+					folder_id,
+					release_id,
+					instance_id,
+					field_id,
+					value,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const nextSteps = buildNextSteps([
+					{ tool: 'list_custom_fields', args: '', hint: 'see all custom fields and their options' },
+					{ tool: 'get_release', args: `release_id=${release_id}`, hint: 'pull full metadata for the release' },
+				])
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Updated field ${field_id} to "${value}" on release ${release_id} (instance ${instance_id})${nextSteps}`,
+						},
+					],
+				}
+			} catch (error) {
+				throw new Error(`Failed to edit custom field: ${error instanceof Error ? error.message : 'Unknown error'}`)
+			}
+		},
+	)
+
+	/**
+	 * Tool: get_wantlist
+	 * List the authenticated user's Discogs wantlist (paginated)
+	 */
+	server.registerTool(
+		'get_wantlist',
+		{
+			description:
+				"List releases on your Discogs wantlist (releases you want but don't own), with any rating and notes you've set. " +
+				'Paginated. Pass notes_contains and/or min_rating to search the whole wantlist and return every match instead of one page; ' +
+				'a want must pass all filters given.',
+			annotations: READ_ONLY,
+			inputSchema: z.object({
+				page: z.number().min(1).optional().default(1).describe('Page number (default: 1). Ignored when a filter is given'),
+				per_page: z.number().min(1).max(100).optional().default(50).describe('Items per page, max 100 (default: 50). Ignored when a filter is given'),
+				notes_contains: z.string().min(1).optional().describe('Only wants whose notes contain this text (case-insensitive)'),
+				min_rating: z.number().int().min(1).max(5).optional().describe('Only wants rated at least this (1–5)'),
+			}),
+		},
+		async ({ page, per_page, notes_contains, min_rating }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+			if (!session) {
+				return { content: [{ type: 'text', text: generateAuthInstructions(connectionId, baseUrl) }] }
+			}
+			try {
+				const userProfile = sessionProfile(session)
+				const fetchPage = (pageNumber: number, perPage: number) =>
+					client.getWantlist(
+						userProfile.username,
+						session.accessToken,
+						session.accessTokenSecret,
+						{ page: pageNumber, per_page: perPage },
+						env.DISCOGS_CONSUMER_KEY,
+						env.DISCOGS_CONSUMER_SECRET,
+					)
+
+				let header: string
+				let wants: DiscogsWant[]
+				if (notes_contains !== undefined || min_rating !== undefined) {
+					const filter = { notesContains: notes_contains, minRating: min_rating }
+					const { matches, scanned, total } = await collectFilteredWants(fetchPage, filter)
+					header = describeFilteredWantlist(filter, matches.length, scanned, total)
+					wants = matches
+				} else {
+					const result = await fetchPage(page, per_page)
+					header = `Wantlist — ${result.pagination.items} item(s), page ${result.pagination.page}/${result.pagination.pages}`
+					wants = result.wants
+				}
+
+				const lines = wants.map(formatWantLine)
+				const nextSteps = buildNextSteps([
+					{ tool: 'get_marketplace_stats', args: 'release_ids=[<id>, ...]', hint: 'check which of these wants are for sale right now' },
+					{ tool: 'add_to_collection', args: 'release_id=<id>', hint: 'move a want into your collection once you acquire it' },
+					{ tool: 'get_release', args: 'release_id=<id>', hint: 'pull tracklist and full metadata for a want' },
+				])
+				return {
+					content: [{ type: 'text', text: `${header}\n${lines.join('\n') || '(empty)'}${nextSteps}` }],
+				}
+			} catch (error) {
+				throw error instanceof Error ? error : new Error('Failed to get wantlist: Unknown error')
+			}
+		},
+	)
+
+	/**
+	 * Tool: add_to_wantlist
+	 * Add a release to the wantlist (PUT)
+	 */
+	server.registerTool(
+		'add_to_wantlist',
+		{
+			description: "Add a release to your Discogs wantlist (releases you want but don't own).",
+			annotations: ADDITIVE_WRITE,
+			inputSchema: z.object({
+				release_id: z.number().describe('The Discogs release ID to want'),
+			}),
+		},
+		async ({ release_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+			if (!session) {
+				return { content: [{ type: 'text', text: generateAuthInstructions(connectionId, baseUrl) }] }
+			}
+			try {
+				const userProfile = sessionProfile(session)
+				const result = await client.addToWantlist(
+					userProfile.username,
+					release_id,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+
+				const title = result?.basic_information?.title ?? `release ${release_id}`
+				const nextSteps = buildNextSteps([
+					{ tool: 'get_wantlist', args: '', hint: 'confirm the release is on your wantlist' },
+					{ tool: 'get_release', args: `release_id=${release_id}`, hint: 'pull tracklist and full metadata' },
+				])
+				return {
+					content: [{ type: 'text', text: `Added ${title} to your wantlist${nextSteps}` }],
+				}
+			} catch (error) {
+				throw error instanceof Error ? error : new Error('Failed to add to wantlist: Unknown error')
+			}
+		},
+	)
+
+	/**
+	 * Tool: remove_from_wantlist
+	 * Remove a release from the wantlist
+	 */
+	server.registerTool(
+		'remove_from_wantlist',
+		{
+			description: 'Remove a release from your Discogs wantlist.',
+			annotations: DESTRUCTIVE_WRITE,
+			inputSchema: z.object({
+				release_id: z.number().describe('The Discogs release ID to remove from the wantlist'),
+			}),
+		},
+		async ({ release_id }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+			if (!session) {
+				return { content: [{ type: 'text', text: generateAuthInstructions(connectionId, baseUrl) }] }
+			}
+			try {
+				const userProfile = sessionProfile(session)
+				await client.removeFromWantlist(
+					userProfile.username,
+					release_id,
+					session.accessToken,
+					session.accessTokenSecret,
+					env.DISCOGS_CONSUMER_KEY,
+					env.DISCOGS_CONSUMER_SECRET,
+				)
+				const nextSteps = buildNextSteps([{ tool: 'get_wantlist', args: '', hint: 'confirm the release is gone' }])
+				return {
+					content: [{ type: 'text', text: `Removed release ${release_id} from your wantlist${nextSteps}` }],
+				}
+			} catch (error) {
+				throw error instanceof Error ? error : new Error('Failed to remove from wantlist: Unknown error')
+			}
+		},
+	)
+
+	/**
+	 * Tool: get_marketplace_stats
+	 * Copies for sale and lowest price for a batch of releases
+	 */
+	server.registerTool(
+		'get_marketplace_stats',
+		{
+			description:
+				'Check how many copies of each release are for sale on the Discogs marketplace and the lowest asking price. ' +
+				'Takes up to 50 release IDs in one call, so a daily check of watched wantlist items needs a single call. ' +
+				'Figures cover all listings regardless of condition or seller location, and may be up to an hour old.',
+			annotations: READ_ONLY,
+			inputSchema: z.object({
+				release_ids: z.array(z.number().int().positive()).min(1).max(50).describe('Discogs release IDs to check (1–50)'),
+				currency: z
+					.enum(DISCOGS_CURRENCIES)
+					.optional()
+					.describe("Currency for prices (default: the user's Discogs currency setting)"),
+			}),
+		},
+		async ({ release_ids, currency }) => {
+			const { session, connectionId, baseUrl } = await getSessionContext()
+			if (!session) {
+				return { content: [{ type: 'text', text: generateAuthInstructions(connectionId, baseUrl) }] }
+			}
+			const userProfile = sessionProfile(session)
+			const uniqueIds = [...new Set(release_ids)]
+
+			// Sequential on purpose: the rate limiter's queue is shallower than a full batch.
+			const lines: string[] = []
+			for (const releaseId of uniqueIds) {
+				try {
+					const stats = cachedClient
+						? await cachedClient.getMarketplaceStats(
+								userProfile.username,
+								releaseId,
+								session.accessToken,
+								session.accessTokenSecret,
+								env.DISCOGS_CONSUMER_KEY,
+								env.DISCOGS_CONSUMER_SECRET,
+								currency,
+							)
+						: await discogsClient.getMarketplaceStats(
+								releaseId,
+								session.accessToken,
+								session.accessTokenSecret,
+								env.DISCOGS_CONSUMER_KEY,
+								env.DISCOGS_CONSUMER_SECRET,
+								currency,
+							)
+					lines.push(formatMarketplaceStatsLine(releaseId, stats))
+				} catch (error) {
+					lines.push(`- release ${releaseId}: could not check (${error instanceof Error ? error.message : 'Unknown error'})`)
+				}
+			}
+
+			const header = `Marketplace stats for ${uniqueIds.length} release(s)`
+			const nextSteps = buildNextSteps([
+				{ tool: 'get_release', args: 'release_id=<id>', hint: 'pull tracklist and full metadata for a listed release' },
+			])
+			return { content: [{ type: 'text', text: `${header}\n${lines.join('\n')}${nextSteps}` }] }
+		},
+	)
+}

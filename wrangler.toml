@@ -1,0 +1,98 @@
+name = "discogs-mcp"
+main = "src/index-oauth.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Drives the collection-sync background refresh; see src/index-oauth.ts
+# scheduled() handler. Every 6 hours is plenty for collection-add cadence.
+# The odd minute/hours (01:23, 07:23, 13:23, 19:23 UTC) are deliberate:
+# Discogs throttles Cloudflare's shared egress IPs, and congestion peaks at
+# the top of the hour when everyone's `0 */6` crons fire — a first request
+# at :00 reliably 429s and trips the rate-limiter circuit breaker.
+[triggers]
+crons = ["23 1,7,13,19 * * *"]
+
+# Optional allowlist: numeric Discogs user ID(s) permitted to authenticate.
+# Accepts a single ID or a comma-separated list (e.g. "123,456,789").
+# Empty = no allowlist (open; default for local dev and self-hosters).
+[vars]
+ALLOWED_DISCOGS_USER_ID = "356966"
+# Optional egress relay for Discogs API calls. Discogs throttles per source IP
+# and Workers share Cloudflare's egress IPs, so the hosted instance routes its
+# calls through a Cloudflare Tunnel to a machine with an IP of its own (see
+# src/rate-limiter/relay.ts). Empty = call api.discogs.com directly, which is
+# the right default for self-hosters and local dev. When set, the two Access
+# service-token secrets RELAY_ACCESS_CLIENT_ID / RELAY_ACCESS_CLIENT_SECRET
+# must be set too, or the relay is treated as off. Keep the origin here and the
+# two credentials as secrets: a plain variable set in the dashboard is removed
+# by the next `wrangler deploy`.
+DISCOGS_RELAY_ORIGIN = "https://example.com"
+
+# Durable Object for coordinated Discogs API rate limiting
+[durable_objects]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "DiscogsRateLimiter" }
+]
+
+# SQLite-backed: the Workers Free plan only supports SQLite Durable Objects,
+# and since July 2026 accounts without an existing key-value namespace can't
+# create one at all, so `new_classes` fails every fresh deploy. The
+# maintainer's deployments predate this and keep their key-value backend;
+# wrangler only submits migrations newer than the tag already applied.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DiscogsRateLimiter"]
+
+# Top-level config doubles as (a) the maintainer's local `wrangler dev` /
+# preview deploy target, and (b) the template the "Deploy to Cloudflare" button
+# clones into a self-hoster's account. The button auto-provisions fresh KV
+# namespaces and rewrites the `id` fields below in the user's fork. The IDs
+# committed here belong to the maintainer's account; they will fail any
+# unrelated `wrangler deploy` (account boundary), which is the desired safety
+# net — self-hosters can't accidentally write to the maintainer's namespaces.
+# Maintainer's hosted instance (discogs-mcp.com) deploys against
+# [env.production] below via `npm run deploy:prod`.
+[[kv_namespaces]]
+binding = "MCP_SESSIONS"
+id = "880ffd69608f460095e062b87e5cd545"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "25e985236ffc4042a3186466d31afc4c"
+
+# Production environment
+[env.production]
+name = "discogs-mcp-prod"
+
+# Lock the hosted instance to the maintainer's Discogs account.
+# Discogs API rate limits are too tight to share, so anyone else must self-host.
+[env.production.vars]
+ALLOWED_DISCOGS_USER_ID = "2579319,2316828"
+# Discogs traffic leaves via the maintainer's Mac mini (Cloudflare Tunnel +
+# local Caddy), guarded by Cloudflare Access; secrets carry the service token.
+DISCOGS_RELAY_ORIGIN = "https://relay.discogs-mcp.com"
+
+[env.production.durable_objects]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "DiscogsRateLimiter" }
+]
+
+[env.production.triggers]
+crons = ["23 1,7,13,19 * * *"]
+
+[[env.production.kv_namespaces]]
+binding = "MCP_SESSIONS"
+id = "e45edcc5347e4b409169c1d0a9b2ed5d"
+
+[[env.production.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "35c396a7d0924dd8a5527334cd4538d3"
+
+# Secrets — declared in .dev.vars.example so the Deploy button prompts for them.
+# For the maintainer's hosted instance, set with `wrangler secret put <NAME> --env production`:
+# - DISCOGS_CONSUMER_KEY
+# - DISCOGS_CONSUMER_SECRET
+# - RELAY_ACCESS_CLIENT_ID / RELAY_ACCESS_CLIENT_SECRET (only with DISCOGS_RELAY_ORIGIN)

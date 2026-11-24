@@ -1,0 +1,245 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { env, createScheduledController, createExecutionContext } from 'cloudflare:test'
+import worker from '../../src/index-oauth'
+import { lastForcedFullSyncKey, snapshotKey, tokenMirrorKey } from '../../src/sync/keys'
+import { readLastSyncRecord } from '../../src/sync/lastOutcome'
+
+// The scheduled handler ultimately calls DiscogsClient.searchCollection, which
+// routes through the rate-limiter Durable Object — its fetch runs in a separate
+// isolate where globalThis.fetch stubbing has no effect. To keep the test
+// hermetic, vi.mock DiscogsClient itself so the handler's `new DiscogsClient(...)`
+// returns a fake whose searchCollection resolves with a canned page.
+vi.mock('../../src/clients/discogs', async (orig) => {
+	const actual = (await orig()) as object
+	return {
+		...actual,
+		DiscogsClient: vi.fn().mockImplementation(function () {
+			return {
+				searchCollection: vi.fn().mockResolvedValue({
+					pagination: { pages: 1, page: 1, per_page: 100, items: 1, urls: {} },
+					releases: [
+						{
+							id: 1,
+							instance_id: 101,
+							folder_id: 0,
+							date_added: '2026-01-01T00:00:00Z',
+							rating: 0,
+							basic_information: {
+								id: 1,
+								title: 't',
+								year: 2020,
+								resource_url: '',
+								thumb: '',
+								cover_image: '',
+								formats: [],
+								labels: [],
+								artists: [],
+								genres: [],
+								styles: [],
+							},
+						},
+					],
+				}),
+				setRateLimiter: vi.fn(),
+			}
+		}),
+	}
+})
+
+describe('scheduled() handler', () => {
+	beforeEach(async () => {
+		const list = await env.MCP_SESSIONS.list()
+		for (const k of list.keys) await env.MCP_SESSIONS.delete(k.name)
+	})
+
+	it('syncs every user in ALLOWED_DISCOGS_USER_ID who has a token mirror', async () => {
+		for (const id of ['12345', '67890']) {
+			await env.MCP_SESSIONS.put(
+				tokenMirrorKey(id),
+				JSON.stringify({
+					numericId: id,
+					username: `user${id}`,
+					accessToken: 'tok',
+					accessTokenSecret: 'sec',
+				}),
+			)
+		}
+
+		const ctrl = createScheduledController({ scheduledTime: Date.now(), cron: '0 * * * *' })
+		const ctx = createExecutionContext()
+		await worker.scheduled!(ctrl, { ...env, ALLOWED_DISCOGS_USER_ID: '12345,67890' } as any, ctx)
+
+		expect(await env.MCP_SESSIONS.get(snapshotKey('12345'))).toBeTruthy()
+		expect(await env.MCP_SESSIONS.get(snapshotKey('67890'))).toBeTruthy()
+	})
+
+	it('isolates per-user crashes and continues with the next user', async () => {
+		// Override the top-level DiscogsClient mock so alpha throws on its first searchCollection.
+		const { DiscogsClient } = await import('../../src/clients/discogs')
+		;(DiscogsClient as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(function () {
+			return {
+				searchCollection: vi.fn().mockRejectedValue(new Error('alpha boom')),
+				setRateLimiter: vi.fn(),
+			}
+		})
+
+		await env.MCP_SESSIONS.put(
+			tokenMirrorKey('alpha'),
+			JSON.stringify({
+				numericId: 'alpha',
+				username: 'a',
+				accessToken: 'tok',
+				accessTokenSecret: 'sec',
+			}),
+		)
+		// 'beta' has no token mirror → handler should log no_token and continue
+
+		// Sync outcomes are now structured-logged to console.log (Workers
+		// Observability ingests them) — capture and parse to verify behavior.
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+		const ctrl = createScheduledController({ scheduledTime: Date.now(), cron: '0 * * * *' })
+		const ctx = createExecutionContext()
+		await worker.scheduled!(ctrl, { ...env, ALLOWED_DISCOGS_USER_ID: 'alpha,beta' } as any, ctx)
+
+		const ids = logSpy.mock.calls
+			.map((args) => args[0])
+			.filter((s): s is string => typeof s === 'string')
+			.map((s) => {
+				try {
+					return JSON.parse(s) as { event?: string; numericId?: string; outcome?: string }
+				} catch {
+					return null
+				}
+			})
+			.filter((e): e is { event: string; numericId: string; outcome: string } => e?.event === 'sync')
+			.map((e) => `${e.numericId}:${e.outcome}`)
+		// alpha's searchCollection rejects → syncCollection's try/catch catches it
+		// and returns outcome: 'failed' (not 'crashed' — that's reserved for errors
+		// that escape syncCollection itself, e.g. during DiscogsClient construction).
+		// Either way, the assertion that matters is: beta still got processed.
+		expect(ids.sort()).toEqual(['alpha:failed', 'beta:no_token'])
+
+		logSpy.mockRestore()
+	})
+
+	it('logs a sync_started event before running each user so a CPU-limit kill leaves a trace', async () => {
+		await env.MCP_SESSIONS.put(
+			tokenMirrorKey('alpha'),
+			JSON.stringify({ numericId: 'alpha', username: 'a', accessToken: 'tok', accessTokenSecret: 'sec' }),
+		)
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+		const ctrl = createScheduledController({ scheduledTime: Date.now(), cron: '0 * * * *' })
+		await worker.scheduled!(ctrl, { ...env, ALLOWED_DISCOGS_USER_ID: 'alpha' } as any, createExecutionContext())
+
+		const events = logSpy.mock.calls
+			.map((args) => args[0])
+			.filter((s): s is string => typeof s === 'string')
+			.map((s) => {
+				try {
+					return JSON.parse(s) as { event?: string; numericId?: string }
+				} catch {
+					return null
+				}
+			})
+			.filter((e): e is { event: string; numericId: string } => !!e?.event && e.numericId === 'alpha')
+			.map((e) => e.event)
+		expect(events.indexOf('sync_started')).toBeGreaterThanOrEqual(0)
+		expect(events.indexOf('sync_started')).toBeLessThan(events.indexOf('sync'))
+
+		logSpy.mockRestore()
+	})
+
+	it('deletes the token mirror when the probe sees a revoked token', async () => {
+		const { DiscogsClient } = await import('../../src/clients/discogs')
+		;(DiscogsClient as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(function () {
+			return {
+				searchCollection: vi
+					.fn()
+					.mockRejectedValue(new Error('Failed to search collection: HTTP 401: {"message":"You must authenticate"}')),
+				setRateLimiter: vi.fn(),
+			}
+		})
+		await env.MCP_SESSIONS.put(
+			tokenMirrorKey('alpha'),
+			JSON.stringify({ numericId: 'alpha', username: 'a', accessToken: 'tok', accessTokenSecret: 'sec' }),
+		)
+		// A snapshot and a recent full sweep put the sync on the probe path.
+		await env.MCP_SESSIONS.put(
+			snapshotKey('alpha'),
+			JSON.stringify({ schemaVersion: 1, fetchedAt: '2026-01-01T00:00:00Z', count: 1, topPageInstanceIds: [101], items: [] }),
+		)
+		await env.MCP_SESSIONS.put(lastForcedFullSyncKey('alpha'), new Date().toISOString())
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+		const ctrl = createScheduledController({ scheduledTime: Date.now(), cron: '0 * * * *' })
+		await worker.scheduled!(ctrl, { ...env, ALLOWED_DISCOGS_USER_ID: 'alpha' } as any, createExecutionContext())
+
+		expect(await env.MCP_SESSIONS.get(tokenMirrorKey('alpha'))).toBeNull()
+		const outcomes = logSpy.mock.calls
+			.map((args) => args[0])
+			.filter((s): s is string => typeof s === 'string' && s.includes('"event":"sync"'))
+			.map((s) => (JSON.parse(s) as { outcome: string }).outcome)
+		expect(outcomes).toEqual(['token_invalid'])
+		expect(await readLastSyncRecord(env.MCP_SESSIONS, 'alpha')).toMatchObject({ outcome: 'token_invalid', trigger: 'scheduled' })
+
+		logSpy.mockRestore()
+	})
+
+	it('records the outcome for each user with trigger scheduled', async () => {
+		// mockImplementationOnce replaces the next DiscogsClient construction and
+		// users run in allowlist order, so the failing user comes first.
+		const { DiscogsClient } = await import('../../src/clients/discogs')
+		;(DiscogsClient as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(function () {
+			return {
+				searchCollection: vi.fn().mockRejectedValue(new Error('Failed to search collection: HTTP 500: boom')),
+				setRateLimiter: vi.fn(),
+			}
+		})
+		for (const id of ['gamma', 'alpha']) {
+			await env.MCP_SESSIONS.put(
+				tokenMirrorKey(id),
+				JSON.stringify({ numericId: id, username: id, accessToken: 'tok', accessTokenSecret: 'sec' }),
+			)
+		}
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+		const ctrl = createScheduledController({ scheduledTime: Date.now(), cron: '0 * * * *' })
+		await worker.scheduled!(ctrl, { ...env, ALLOWED_DISCOGS_USER_ID: 'gamma,alpha,beta' } as any, createExecutionContext())
+
+		expect(await readLastSyncRecord(env.MCP_SESSIONS, 'gamma')).toMatchObject({
+			outcome: 'failed',
+			trigger: 'scheduled',
+			error: 'Failed to search collection: HTTP 500: boom',
+			consecutiveFailures: 1,
+		})
+		expect(await readLastSyncRecord(env.MCP_SESSIONS, 'alpha')).toMatchObject({ outcome: 'completed', trigger: 'scheduled' })
+		expect(await readLastSyncRecord(env.MCP_SESSIONS, 'beta')).toMatchObject({ outcome: 'no_token', trigger: 'scheduled' })
+
+		logSpy.mockRestore()
+	})
+
+	it('records crashed when the sync throws outside its own error handling', async () => {
+		const { DiscogsClient } = await import('../../src/clients/discogs')
+		;(DiscogsClient as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(function () {
+			throw new Error('ctor boom')
+		})
+		await env.MCP_SESSIONS.put(
+			tokenMirrorKey('alpha'),
+			JSON.stringify({ numericId: 'alpha', username: 'a', accessToken: 'tok', accessTokenSecret: 'sec' }),
+		)
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+		const ctrl = createScheduledController({ scheduledTime: Date.now(), cron: '0 * * * *' })
+		await worker.scheduled!(ctrl, { ...env, ALLOWED_DISCOGS_USER_ID: 'alpha' } as any, createExecutionContext())
+
+		expect(await readLastSyncRecord(env.MCP_SESSIONS, 'alpha')).toMatchObject({
+			outcome: 'crashed',
+			trigger: 'scheduled',
+			error: 'ctor boom',
+		})
+
+		logSpy.mockRestore()
+	})
+})

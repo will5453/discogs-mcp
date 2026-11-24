@@ -1,0 +1,70 @@
+{
+	"name": "discogs-mcp",
+	"version": "0.0.0",
+	"private": true,
+	"license": "MIT",
+	"type": "module",
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"deploy:prod": "wrangler deploy --env production",
+		"dev": "wrangler dev --port 8787",
+		"start": "wrangler dev",
+		"test": "vitest",
+		"test:multi-user": "node scripts/test-multi-user.js",
+		"cf-typegen": "wrangler types",
+		"lint": "eslint src --ext .ts,.tsx",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"build": "wrangler deploy --dry-run --outdir dist",
+		"setup:prod": "./scripts/setup-production.sh",
+		"postinstall": "node scripts/patch-ajv.js"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.22.0",
+		"@cloudflare/workers-types": "^5.20260815.1",
+		"@modelcontextprotocol/client": "2.3.1",
+		"@types/node": "^22.20.1",
+		"@typescript-eslint/eslint-plugin": "^8.33.1",
+		"@typescript-eslint/parser": "^8.33.1",
+		"ajv": "^8.17.1",
+		"eslint": "^8.57.1",
+		"eslint-config-prettier": "^10.1.5",
+		"prettier": "^3.5.3",
+		"typescript": "^5.5.2",
+		"vitest": "^4.1.11",
+		"wrangler": "4.124.0"
+	},
+	"dependencies": {
+		"@cloudflare/workers-oauth-provider": "^1.2.2",
+		"@modelcontextprotocol/server": "2.3.1",
+		"@types/crypto-js": "^4.2.2",
+		"agents": "0.30.0",
+		"crypto-js": "^4.2.0",
+		"minisearch": "^7.2.0",
+		"oauth-1.0a": "^2.2.6",
+		"zod": "^4.1.13"
+	},
+	"cloudflare": {
+		"label": "Discogs MCP Server",
+		"products": [
+			"Workers",
+			"KV",
+			"Durable Objects"
+		],
+		"categories": [
+			"ai"
+		],
+		"docs_url": "https://github.com/rianvdm/discogs-mcp#readme",
+		"bindings": {
+			"DISCOGS_CONSUMER_KEY": {
+				"description": "Your Discogs app **Consumer Key**. Register an app at [discogs.com/settings/developers](https://www.discogs.com/settings/developers) — name it anything, callback URL doesn't need to match yet (you'll update it after deploy)."
+			},
+			"DISCOGS_CONSUMER_SECRET": {
+				"description": "Your Discogs app **Consumer Secret** (shown alongside the Consumer Key on the same page)."
+			},
+			"ALLOWED_DISCOGS_USER_ID": {
+				"description": "**Optional.** Numeric Discogs user ID(s) permitted to authenticate — comma-separated for multiple users (e.g. `123456,789012`). Find your ID at `https://api.discogs.com/users/<your-username>`. Leave blank for an open instance."
+			}
+		}
+	}
+}
